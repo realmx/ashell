@@ -4293,7 +4293,11 @@ impl Ashell {
                             .when(
                                 self.active_title_bar_style
                                     == crate::session::config::TitleBarStyle::Integrated,
-                                |this| this.window_control_area(gpui::WindowControlArea::Drag),
+                                |this| {
+                                    this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                        window.start_window_move();
+                                    })
+                                },
                             )
                             .overflow_x_hidden()
                             .child({
