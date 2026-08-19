@@ -9,6 +9,7 @@ pub mod startup;
 pub mod system_menu;
 pub mod theme;
 pub mod ui;
+pub mod window_drag;
 
 use std::{
     cell::{Cell, RefCell},

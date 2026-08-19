@@ -4295,7 +4295,7 @@ impl Ashell {
                                     == crate::session::config::TitleBarStyle::Integrated,
                                 |this| {
                                     this.on_mouse_down(MouseButton::Left, |_, window, _| {
-                                        window.start_window_move();
+                                        crate::app::window_drag::start_window_drag(window);
                                     })
                                 },
                             )
