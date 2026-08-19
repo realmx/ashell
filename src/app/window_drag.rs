@@ -9,11 +9,9 @@
 pub(crate) fn start_window_drag(window: &gpui::Window) {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Foundation::{HWND, WPARAM};
         use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SC_MOVE, SendMessageW, WM_SYSCOMMAND, WPARAM,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{SC_MOVE, SendMessageW, WM_SYSCOMMAND};
 
         let Some(handle) = crate::desktop_notification::native_window_handle(window) else {
             tracing::warn!("failed to start window drag: missing native window handle");
