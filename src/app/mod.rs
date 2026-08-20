@@ -9,6 +9,7 @@ pub mod startup;
 pub mod system_menu;
 pub mod theme;
 pub mod ui;
+pub mod window_drag;
 
 use std::{
     cell::{Cell, RefCell},
@@ -402,7 +403,6 @@ pub(crate) struct Ashell {
     pub(crate) cmd_ctrl_pressed: bool,
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
     pub(crate) last_window_bounds: Option<gpui::WindowBounds>,
-    pub(crate) window_bounds_save_task: Option<gpui::Task<()>>,
     pub(crate) save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -923,7 +923,6 @@ impl Ashell {
             cmd_ctrl_pressed: false,
             _subscriptions,
             last_window_bounds: Some(window.window_bounds()),
-            window_bounds_save_task: None,
             save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -2210,21 +2209,18 @@ impl Ashell {
         }
         self.last_window_bounds = Some(current_bounds);
 
-        self.window_bounds_save_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if this.capture_layout_state(window, cx) {
-                    this.save_preferences_background();
-                }
-            });
-        }));
+        // Save synchronously on the main thread. Background saves are killed by
+        // ExitProcess on Windows before they can flush during shutdown.
+        if self.capture_layout_state(window, cx) {
+            self.save_layout_state(window, cx);
+        }
     }
 
     fn save_layout_on_app_quit(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
         crate::desktop_notification::clear_unread_indicator(self.native_window_handle);
         let entity_id = cx.entity_id();
+        // Save synchronously: GPUI gives quit handlers only 100ms, and Windows
+        // ExitProcess kills background tasks before they can flush.
         let _ = cx.with_window(entity_id, |window, cx| {
             self.save_layout_state(window, cx);
         });

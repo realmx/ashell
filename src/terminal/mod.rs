@@ -778,7 +778,7 @@ pub enum BackendTx {
     Local(Sender<BackendCommand>),
     Ssh(tokio::sync::mpsc::UnboundedSender<BackendCommand>),
     Serial(tokio::sync::mpsc::UnboundedSender<BackendCommand>),
-    /// A restored session that is waiting for the user to confirm reconnecting.
+    /// A restored session that is waiting for its backend to be started.
     Pending,
 }
 
@@ -1080,6 +1080,32 @@ mod backend_event_tests {
             Some(BackendEvent::Connected { .. })
         ));
         assert!(received.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod terminal_tab_backend_tests {
+    use super::{BackendTx, GuardedBackendEventSender, TerminalTab};
+
+    #[test]
+    fn pending_backend_starts_only_before_a_disconnect_or_backend_swap() {
+        let (events_tx, _events_rx) = std::sync::mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+
+        assert!(tab.backend_start_pending());
+
+        tab.disconnected_reason = Some("startup failed".into());
+        assert!(!tab.backend_start_pending());
+
+        tab.disconnected_reason = None;
+        let (backend_tx, _backend_rx) = std::sync::mpsc::channel();
+        tab.set_backend(BackendTx::Local(backend_tx));
+        assert!(!tab.backend_start_pending());
     }
 }
 
@@ -1612,6 +1638,20 @@ impl TerminalTab {
         if let Ok(mut backend) = self.backend.lock() {
             *backend = new_backend;
         }
+    }
+
+    /// Returns whether this tab is waiting for its first backend start.
+    pub(crate) fn backend_start_pending(&self) -> bool {
+        self.disconnected_reason.is_none()
+            && self
+                .backend
+                .lock()
+                .is_ok_and(|backend| matches!(*backend, BackendTx::Pending))
+    }
+
+    /// Clones the guarded event sender for a backend started after layout.
+    pub(crate) fn backend_events(&self) -> GuardedBackendEventSender {
+        self.backend_events.clone()
     }
 
     /// Advances this tab to a new backend generation and returns its sender.
