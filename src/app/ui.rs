@@ -5014,6 +5014,7 @@ impl Ashell {
                         terminal::element::TerminalElementConfig {
                             view: cx.entity(),
                             focus_handle,
+                            pane_focused: is_focused,
                             snapshot,
                             marked_text,
                             font_family,
