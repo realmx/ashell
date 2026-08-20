@@ -1,9 +1,13 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
-    Anchor, AppContext as _, Context, ElementId, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
+    Anchor, AppContext as _, Context, DismissEvent, ElementId, Empty, Focusable as _, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
     PathBuilder, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
     hsla, point, prelude::FluentBuilder as _, px, relative, rems, uniform_list,
 };
@@ -18,7 +22,6 @@ use gpui_component::{
     progress::Progress,
     scroll::{ScrollableElement as _, Scrollbar, ScrollbarShow},
     spinner::Spinner,
-    tab::{Tab, TabBar},
     v_flex,
 };
 use rust_i18n::t;
@@ -95,6 +98,11 @@ struct ConnectionGroupSection {
     sessions: Vec<crate::session::config::Session>,
 }
 
+#[derive(Clone)]
+struct TabGroupDrag {
+    group_id: String,
+}
+
 fn compact_menu_width(labels: &[&str]) -> Pixels {
     let display_units = labels
         .iter()
@@ -108,7 +116,89 @@ fn compact_menu_width(labels: &[&str]) -> Pixels {
     px((display_units * 7.2 + 28.0).clamp(72.0, 240.0))
 }
 
+const TAB_SCROLL_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+
 impl Ashell {
+    fn tab_scroll_target_x(&self, index: usize) -> Option<Pixels> {
+        let scroll_handle = &self.tabs_scroll_handle;
+        let scroll_bounds = scroll_handle.bounds();
+        let viewport = self
+            .tabs_viewport_bounds
+            .map(|bounds| bounds.intersect(&scroll_bounds))
+            .unwrap_or(scroll_bounds);
+        let tab_bounds = scroll_handle.bounds_for_item(index)?;
+
+        if viewport.size.width <= px(0.) {
+            return None;
+        }
+
+        let offset = scroll_handle.offset();
+        let visible_left = tab_bounds.left() + offset.x;
+        let visible_right = tab_bounds.right() + offset.x;
+        let target_x = if tab_bounds.size.width >= viewport.size.width {
+            viewport.left() - tab_bounds.left()
+        } else if visible_left < viewport.left() {
+            offset.x + viewport.left() - visible_left
+        } else if visible_right > viewport.right() {
+            offset.x + viewport.right() - visible_right
+        } else {
+            offset.x
+        };
+
+        let max_offset = scroll_handle.max_offset();
+        Some(target_x.clamp(-max_offset.x, px(0.)))
+    }
+
+    fn animate_tab_scroll(
+        &mut self,
+        start_x: Pixels,
+        target_x: Pixels,
+        started_at: Instant,
+        animation_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.on_next_frame(window, move |this, window, cx| {
+            if this.tab_scroll_animation_id != animation_id {
+                return;
+            }
+
+            let progress = (started_at.elapsed().as_secs_f32()
+                / TAB_SCROLL_ANIMATION_DURATION.as_secs_f32())
+            .clamp(0., 1.);
+            let eased = 1. - (1. - progress).powi(3);
+            let current_x = if progress >= 1. {
+                target_x
+            } else {
+                px(start_x.as_f32() + (target_x.as_f32() - start_x.as_f32()) * eased)
+            };
+            let offset = this.tabs_scroll_handle.offset();
+            this.tabs_scroll_handle
+                .set_offset(point(current_x, offset.y));
+            cx.notify();
+
+            if progress < 1. {
+                this.animate_tab_scroll(start_x, target_x, started_at, animation_id, window, cx);
+            }
+        });
+    }
+
+    fn ensure_tab_visible(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_scroll_animation_id = self.tab_scroll_animation_id.wrapping_add(1);
+        let animation_id = self.tab_scroll_animation_id;
+        cx.on_next_frame(window, move |this, window, cx| {
+            let Some(target_x) = this.tab_scroll_target_x(index) else {
+                return;
+            };
+            let start_x = this.tabs_scroll_handle.offset().x;
+            if (target_x.as_f32() - start_x.as_f32()).abs() <= 0.5 {
+                return;
+            }
+
+            this.animate_tab_scroll(start_x, target_x, Instant::now(), animation_id, window, cx);
+        });
+    }
+
     fn tab_group_display_name(&self, group: &crate::app::TabGroup) -> String {
         let pane_ids = group.pane_root.tab_ids();
         let configured_title = group.title.trim();
@@ -3984,6 +4074,7 @@ impl Ashell {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
         let active_group_index = self
             .active_group
             .as_ref()
@@ -4011,7 +4102,7 @@ impl Ashell {
             })
             .collect();
         let tabbar_menu = {
-            let view = cx.entity();
+            let view = view.clone();
             let tab_entries = groups_data.clone();
             h_flex().flex_none().child(
                 pointer_button("tabbar-menu")
@@ -4019,21 +4110,74 @@ impl Ashell {
                     .small()
                     .icon(IconName::ChevronDown)
                     .tooltip(t!("settings_tab_list").to_string())
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, _| {
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, menu_cx| {
+                        let popup_menu = menu_cx.entity();
                         tab_entries.iter().enumerate().fold(
                             menu.scrollable(true),
                             |menu, (ix, (group_id, label, _))| {
                                 let group_id = group_id.clone();
+                                let drag_group_id = group_id.clone();
+                                let target_group_id = group_id.clone();
+                                let target_group_for_style = group_id.clone();
+                                let item_view = view.clone();
+                                let item_menu = popup_menu.clone();
+                                let label = label.clone();
                                 menu.item(
-                                    PopupMenuItem::new(label.clone())
-                                        .checked(ix == selected)
-                                        .on_click(window.listener_for(
-                                            &view,
-                                            move |this, _, window, cx| {
-                                                this.tabs_scroll_handle.scroll_to_item(ix);
-                                                this.activate_group(group_id.clone(), window, cx);
-                                            },
-                                        )),
+                                    PopupMenuItem::element(move |_, _| {
+                                        let drag_group_id = drag_group_id.clone();
+                                        let target_group_for_style = target_group_for_style.clone();
+                                        let drop_view = item_view.clone();
+                                        let drop_menu = item_menu.clone();
+                                        let drop_target = target_group_id.clone();
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .items_center()
+                                            .id(("tab-group-drag", ix))
+                                            .cursor_grab()
+                                            .drag_over::<TabGroupDrag>(move |this, drag, _, cx| {
+                                                if drag.group_id == target_group_for_style {
+                                                    this
+                                                } else {
+                                                    this.border_t_2()
+                                                        .border_color(cx.theme().drag_border)
+                                                        .bg(cx.theme().drop_target)
+                                                }
+                                            })
+                                            .on_drag(
+                                                TabGroupDrag {
+                                                    group_id: drag_group_id,
+                                                },
+                                                |drag, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.new(|_| {
+                                                        let _ = drag;
+                                                        Empty
+                                                    })
+                                                },
+                                            )
+                                            .on_drop::<TabGroupDrag>(move |drag, _, cx| {
+                                                let dragged_group_id = drag.group_id.clone();
+                                                drop_view.update(cx, |this, cx| {
+                                                    this.reorder_tab_groups(
+                                                        &dragged_group_id,
+                                                        &drop_target,
+                                                        cx,
+                                                    );
+                                                });
+                                                drop_menu.update(cx, |_, cx| {
+                                                    cx.emit(DismissEvent);
+                                                });
+                                            })
+                                            .child(label.clone())
+                                    })
+                                    .checked(ix == selected)
+                                    .on_click(
+                                        window.listener_for(&view, move |this, _, window, cx| {
+                                            this.activate_group(group_id.clone(), window, cx);
+                                            this.ensure_tab_visible(ix, window, cx);
+                                        }),
+                                    ),
                                 )
                             },
                         )
@@ -4078,11 +4222,22 @@ impl Ashell {
                             .h_full()
                             .overflow_x_hidden()
                             .child({
-                                TabBar::new("ashell-tab-bar")
-                                    .underline()
-                                    .small()
+                                h_flex()
+                                    .id("ashell-tab-bar")
+                                    .relative()
+                                    .min_w(px(0.))
+                                    .w_full()
+                                    .h_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .overflow_x_scroll()
                                     .track_scroll(&self.tabs_scroll_handle)
-                                    .selected_index(selected)
+                                    .on_scroll_wheel(cx.listener(|this, _, _, _| {
+                                        this.tab_scroll_animation_id =
+                                            this.tab_scroll_animation_id.wrapping_add(1);
+                                    }))
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
                                     .children(groups_data.iter().enumerate().map(
                                         |(ix, (group_id, title, pane_ids))| {
                                             let gid = group_id.clone();
@@ -4117,9 +4272,25 @@ impl Ashell {
                                                     .find(|tab| tab.id == *id)
                                                     .is_some_and(TerminalTab::is_command_active)
                                             });
-                                            Tab::new()
+                                            h_flex()
+                                                .id(("ashell-tab", ix))
+                                                .relative()
+                                                .flex_none()
+                                                .h(px(30.))
                                                 .min_w(px(112.))
                                                 .max_w(px(220.))
+                                                .border_b_2()
+                                                .border_color(if ix == selected {
+                                                    cx.theme().primary
+                                                } else {
+                                                    cx.theme().transparent
+                                                })
+                                                .text_size(rems(0.875))
+                                                .hover(|this| {
+                                                    this.text_color(
+                                                        cx.theme().tab_active_foreground,
+                                                    )
+                                                })
                                                 .child(
                                                     h_flex()
                                                         .w_full()
@@ -4220,8 +4391,14 @@ impl Ashell {
                                                 ))
                                         },
                                     ))
-                                    .w_full()
-                                    .h_full()
+                            })
+                            .on_prepaint({
+                                let view = view.clone();
+                                move |bounds, _, cx| {
+                                    view.update(cx, |this, _| {
+                                        this.tabs_viewport_bounds = Some(bounds);
+                                    });
+                                }
                             }),
                     )
                     .child(tabbar_menu),
@@ -5075,28 +5252,38 @@ impl Render for Ashell {
             let view = cx.entity();
             v_flex()
                 .size_full()
+                .min_w(px(0.))
+                .items_stretch()
                 .child(
-                    div().flex_1().min_h(px(0.)).child(
-                        v_resizable("ashell-body")
-                            .lock(self.config.lock_layout())
-                            .with_state(&self.body_panels)
-                            .on_resize(move |_, _, cx| {
-                                view.update(cx, |this, _| {
-                                    this.is_layout_reset = false;
-                                });
-                            })
-                            .child(resizable_panel().child(self.render_terminal_panel(window, cx)))
-                            .child(
-                                resizable_panel()
-                                    .size(sftp_size)
-                                    .size_range(if self.sftp_panel_minimized {
-                                        px(minimized_height)..px(minimized_height)
-                                    } else {
-                                        px(min_panel_height)..px(1200.)
-                                    })
-                                    .child(self.render_sftp_panel(window, cx)),
-                            ),
-                    ),
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_hidden()
+                        .child(
+                            v_resizable("ashell-body")
+                                .lock(self.config.lock_layout())
+                                .with_state(&self.body_panels)
+                                .on_resize(move |_, _, cx| {
+                                    view.update(cx, |this, _| {
+                                        this.is_layout_reset = false;
+                                    });
+                                })
+                                .child(
+                                    resizable_panel().child(self.render_terminal_panel(window, cx)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size(sftp_size)
+                                        .size_range(if self.sftp_panel_minimized {
+                                            px(minimized_height)..px(minimized_height)
+                                        } else {
+                                            px(min_panel_height)..px(1200.)
+                                        })
+                                        .child(self.render_sftp_panel(window, cx)),
+                                ),
+                        ),
                 )
                 .when(is_monitor_bottom, |this| {
                     this.child(self.render_monitoring_panel(
@@ -5109,10 +5296,15 @@ impl Render for Ashell {
         } else {
             v_flex()
                 .size_full()
+                .min_w(px(0.))
+                .items_stretch()
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .flex_1()
                         .min_h(px(0.))
+                        .overflow_hidden()
                         .child(self.render_terminal_panel(window, cx)),
                 )
                 .when(is_monitor_bottom, |this| {
@@ -5154,9 +5346,10 @@ impl Render for Ashell {
                 .flex_none()
                 .child(self.sidebar(cx));
 
-            let main_area = resizable_panel().child(
+            let main_area = resizable_panel().min_w(px(0.)).child(
                 v_flex()
                     .size_full()
+                    .min_w(px(0.))
                     .relative()
                     .overflow_hidden()
                     .when(
@@ -5301,7 +5494,13 @@ impl Render for Ashell {
                 )
             })
             .child(
-                div().flex_1().min_h_0().child(workspace),
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(workspace),
             )
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
