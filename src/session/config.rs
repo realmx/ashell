@@ -257,6 +257,17 @@ pub enum CursorStyle {
     BeamBlink,
 }
 
+/// Selects the shell used when a new local terminal is opened on Windows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalTerminalShell {
+    #[default]
+    WindowsPowerShell,
+    PowerShell7,
+    CommandPrompt,
+    GitBash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default = "default_follow_system_theme")]
@@ -273,6 +284,8 @@ pub struct ConfigFile {
     pub terminal_font_size: f32,
     #[serde(default)]
     pub local_terminal_encoding: TextEncoding,
+    #[serde(default)]
+    pub local_terminal_shell: LocalTerminalShell,
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
     #[serde(default)]
@@ -452,6 +465,7 @@ impl Default for ConfigFile {
             locale: default_locale(),
             terminal_font_size: default_terminal_font_size(),
             local_terminal_encoding: TextEncoding::Utf8,
+            local_terminal_shell: LocalTerminalShell::default(),
             ui_font_size: default_ui_font_size(),
             right_click_copy_paste: false,
             keyword_highlight: false,
@@ -1265,6 +1279,14 @@ impl ConfigStore {
         self.cache.local_terminal_encoding = encoding;
     }
 
+    pub fn local_terminal_shell(&self) -> LocalTerminalShell {
+        self.cache.local_terminal_shell
+    }
+
+    pub fn set_local_terminal_shell(&mut self, shell: LocalTerminalShell) {
+        self.cache.local_terminal_shell = shell;
+    }
+
     pub fn ui_font_size(&self) -> f32 {
         if self.cache.ui_font_size <= 0.0
             || (self.cache.ui_font_size - LEGACY_DEFAULT_UI_FONT_SIZE).abs() < 0.01
@@ -1488,6 +1510,7 @@ impl ConfigStore {
         disk_config.locale = local_config.locale;
         disk_config.terminal_font_size = local_config.terminal_font_size;
         disk_config.local_terminal_encoding = local_config.local_terminal_encoding;
+        disk_config.local_terminal_shell = local_config.local_terminal_shell;
         disk_config.ui_font_size = local_config.ui_font_size;
         disk_config.right_click_copy_paste = local_config.right_click_copy_paste;
         disk_config.keyword_highlight = local_config.keyword_highlight;
@@ -1912,6 +1935,10 @@ mod tests {
         assert!(!config.sftp_file_columns_customized);
         assert!(config.connection_groups.is_empty());
         assert_eq!(config.local_terminal_encoding, TextEncoding::Utf8);
+        assert_eq!(
+            config.local_terminal_shell,
+            LocalTerminalShell::WindowsPowerShell
+        );
         assert!(config.collapsed_connection_groups.is_empty());
     }
 
@@ -2015,6 +2042,7 @@ mod tests {
     #[test]
     fn test_saved_tabs_roundtrip() {
         let config = ConfigFile {
+            local_terminal_shell: LocalTerminalShell::PowerShell7,
             remember_tabs: true,
             saved_tabs: Some(SavedTabsState {
                 groups: vec![SavedTabGroup {
@@ -2039,6 +2067,10 @@ mod tests {
         let restored: ConfigFile = serde_json::from_str(&json).unwrap();
 
         assert!(restored.remember_tabs);
+        assert_eq!(
+            restored.local_terminal_shell,
+            LocalTerminalShell::PowerShell7
+        );
         let restored_tabs = restored.saved_tabs.unwrap();
         assert_eq!(restored_tabs.groups.len(), 1);
         assert_eq!(restored_tabs.active_tab.as_deref(), Some("tab-1"));
@@ -2083,6 +2115,7 @@ mod tests {
             ui_font_size: 18.0,
             terminal_font_size: 20.0,
             local_terminal_encoding: TextEncoding::Gbk,
+            local_terminal_shell: LocalTerminalShell::GitBash,
             show_hidden_files: true,
             sftp_file_columns_customized: true,
             remember_tabs: true,
@@ -2121,6 +2154,7 @@ mod tests {
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
         assert_eq!(decrypted.local_terminal_encoding, TextEncoding::Gbk);
+        assert_eq!(decrypted.local_terminal_shell, LocalTerminalShell::GitBash);
         assert!(decrypted.show_hidden_files);
         assert!(decrypted.sftp_file_columns_customized);
         assert!(decrypted.remember_tabs);

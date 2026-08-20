@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
     time::Duration,
@@ -14,6 +14,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 #[cfg(not(windows))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use crate::session::config::LocalTerminalShell;
 use crate::terminal::{BackendCommand, BackendEvent, BackendTx, GuardedBackendEventSender};
 
 #[cfg(not(windows))]
@@ -32,12 +33,172 @@ fn local_process_directory(system: &mut System, pid: Pid) -> Option<std::path::P
         .map(std::path::PathBuf::from)
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalTerminalShellLaunch {
+    pub executable: PathBuf,
+}
+
+/// Resolves a configured local shell to an executable available on this host.
+pub fn resolve_local_terminal_shell(
+    shell: LocalTerminalShell,
+) -> anyhow::Result<LocalTerminalShellLaunch> {
+    #[cfg(not(windows))]
+    let _ = shell;
+
+    #[cfg(windows)]
+    {
+        let executable = match shell {
+            LocalTerminalShell::WindowsPowerShell => resolve_windows_powershell(),
+            LocalTerminalShell::PowerShell7 => resolve_powershell7(),
+            LocalTerminalShell::CommandPrompt => resolve_command_prompt(),
+            LocalTerminalShell::GitBash => resolve_git_bash(),
+        }
+        .ok_or_else(|| anyhow::anyhow!("configured local shell is not installed: {shell:?}"))?;
+        return Ok(LocalTerminalShellLaunch { executable });
+    }
+
+    #[cfg(not(windows))]
+    {
+        let executable = std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+        Ok(LocalTerminalShellLaunch { executable })
+    }
+}
+
+pub fn local_terminal_shell_available(shell: LocalTerminalShell) -> bool {
+    resolve_local_terminal_shell(shell).is_ok()
+}
+
+#[cfg(windows)]
+fn existing_file(path: PathBuf) -> Option<PathBuf> {
+    path.is_file().then_some(path)
+}
+
+#[cfg(windows)]
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn find_on_path(name: &str, predicate: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file() && predicate(candidate))
+}
+
+#[cfg(windows)]
+fn resolve_windows_powershell() -> Option<PathBuf> {
+    let system_root = env_path("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    existing_file(system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"))
+        .or_else(|| find_on_path("powershell.exe", |_| true))
+}
+
+#[cfg(windows)]
+fn resolve_powershell7() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(program_files) = env_path("ProgramFiles") {
+        roots.push(program_files.join("PowerShell"));
+    }
+    if let Some(program_files) = env_path("ProgramW6432") {
+        roots.push(program_files.join("PowerShell"));
+    }
+    if let Some(program_files) = env_path("ProgramFiles(x86)") {
+        roots.push(program_files.join("PowerShell"));
+    }
+    if let Some(local_app_data) = env_path("LOCALAPPDATA") {
+        roots.push(local_app_data.join(r"Programs\PowerShell"));
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(local_app_data) = env_path("LOCALAPPDATA") {
+        candidates.push(local_app_data.join(r"Microsoft\WindowsApps\pwsh.exe"));
+    }
+    if let Some(scoop) = env_path("SCOOP") {
+        candidates.push(scoop.join(r"apps\powershell\current\pwsh.exe"));
+    }
+    if let Some(user_profile) = env_path("USERPROFILE") {
+        candidates.push(user_profile.join(r"scoop\apps\powershell\current\pwsh.exe"));
+    }
+    for root in roots {
+        if let Some(candidate) = existing_file(root.join("pwsh.exe")) {
+            candidates.push(candidate);
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut versions = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.')
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by_key(|entry| entry.file_name());
+        candidates.extend(
+            versions
+                .into_iter()
+                .rev()
+                .filter_map(|entry| existing_file(entry.path().join("pwsh.exe"))),
+        );
+    }
+
+    candidates
+        .into_iter()
+        .next()
+        .or_else(|| find_on_path("pwsh.exe", |_| true))
+}
+
+#[cfg(windows)]
+fn resolve_command_prompt() -> Option<PathBuf> {
+    env_path("ComSpec")
+        .and_then(existing_file)
+        .or_else(|| {
+            let system_root =
+                env_path("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            existing_file(system_root.join(r"System32\cmd.exe"))
+        })
+        .or_else(|| find_on_path("cmd.exe", |_| true))
+}
+
+#[cfg(windows)]
+fn resolve_git_bash() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for variable in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(program_files) = env_path(variable) {
+            candidates.push(program_files.join(r"Git\bin\bash.exe"));
+        }
+    }
+    if let Some(local_app_data) = env_path("LOCALAPPDATA") {
+        candidates.push(local_app_data.join(r"Programs\Git\bin\bash.exe"));
+    }
+    if let Some(scoop) = env_path("SCOOP") {
+        candidates.push(scoop.join(r"apps\git\current\bin\bash.exe"));
+    }
+    if let Some(user_profile) = env_path("USERPROFILE") {
+        candidates.push(user_profile.join(r"scoop\apps\git\current\bin\bash.exe"));
+    }
+
+    candidates.into_iter().find_map(existing_file).or_else(|| {
+        find_on_path("bash.exe", |candidate| {
+            let path = candidate.to_string_lossy().to_ascii_lowercase();
+            path.contains("\\git\\") || path.contains("/git/")
+        })
+    })
+}
+
 pub fn spawn_local_terminal_at(
     tab_id: String,
     cols: u16,
     rows: u16,
     events: GuardedBackendEventSender,
     initial_directory: Option<&Path>,
+    shell: LocalTerminalShell,
 ) -> Result<BackendTx> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -49,13 +210,8 @@ pub fn spawn_local_terminal_at(
         })
         .context("open local PTY")?;
 
-    let shell = if cfg!(windows) {
-        "powershell.exe".to_string()
-    } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
-    };
-
-    let mut cmd = CommandBuilder::new(&shell);
+    let launch = resolve_local_terminal_shell(shell).context("resolve local shell")?;
+    let mut cmd = CommandBuilder::new(&launch.executable);
     #[cfg(windows)]
     {
         const POWERSHELL_CWD_REPORTER: &str = r#"& {
@@ -69,7 +225,33 @@ pub fn spawn_local_terminal_at(
                 "$promptText$([char]27)]133;B$([char]7)"
             }
         }"#;
-        cmd.args(["-NoLogo", "-NoExit", "-Command", POWERSHELL_CWD_REPORTER]);
+        match shell {
+            LocalTerminalShell::WindowsPowerShell | LocalTerminalShell::PowerShell7 => {
+                cmd.args(["-NoLogo", "-NoExit", "-Command", POWERSHELL_CWD_REPORTER]);
+            }
+            LocalTerminalShell::CommandPrompt => {
+                let original_prompt =
+                    std::env::var("PROMPT").unwrap_or_else(|_| "$P$G".to_string());
+                let prompt = format!(
+                    "\x1b]133;D\x07\x1b]133;A\x07\x1b]0;ASHELL_CWD:$P\x07{original_prompt}\x1b]133;B\x07"
+                );
+                cmd.args(["/Q"]);
+                cmd.env("PROMPT", prompt);
+            }
+            LocalTerminalShell::GitBash => {
+                let reporter = r#"printf '\033]133;D\a\033]133;A\a\033]0;ASHELL_CWD:%s\a' "$(pwd -W 2>/dev/null || pwd)""#;
+                let original_prompt_command = std::env::var("PROMPT_COMMAND").ok();
+                let prompt_command = match original_prompt_command {
+                    Some(command) if !command.trim().is_empty() => {
+                        format!("{reporter};{command}")
+                    }
+                    _ => reporter.to_string(),
+                };
+                cmd.args(["--login", "-i"]);
+                cmd.env("CHERE_INVOKING", "1");
+                cmd.env("PROMPT_COMMAND", prompt_command);
+            }
+        }
     }
     cmd.env(
         "TERM",
@@ -94,7 +276,7 @@ pub fn spawn_local_terminal_at(
     if let Some(directory) = initial_directory.filter(|path| path.is_dir()) {
         cmd.cwd(directory.as_os_str());
     }
-    cmd.env("SHELL", shell);
+    cmd.env("SHELL", launch.executable.as_os_str());
     let mut child = pair.slave.spawn_command(cmd).context("spawn local shell")?;
     #[cfg(not(windows))]
     let child_pid = child.process_id().map(Pid::from_u32);

@@ -929,8 +929,17 @@ impl Ashell {
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
+        let local_shell_fallback = this.normalize_local_terminal_shell();
         this.apply_theme_preferences(window, cx);
         this.restore_saved_tabs(window, cx);
+        if let Some(fallback) = local_shell_fallback {
+            this.status = t!(
+                "local_terminal_shell_fallback",
+                terminal = crate::session::local_terminal_shell_label(fallback)
+            )
+            .to_string()
+            .into();
+        }
         this.report_active_terminal_focus(this.window_active);
         this.start_event_pump(window, cx);
         this
@@ -958,6 +967,15 @@ impl Ashell {
         self.sftp_panel_minimized = self.config.sftp_panel_minimized();
         self.sidebar_collapsed = self.config.sidebar_collapsed();
         self.active_title_bar_style = self.config.title_bar_style();
+
+        if let Some(fallback) = self.normalize_local_terminal_shell() {
+            self.status = t!(
+                "local_terminal_shell_fallback",
+                terminal = crate::session::local_terminal_shell_label(fallback)
+            )
+            .to_string()
+            .into();
+        }
 
         // Apply theme preferences
         self.apply_theme_preferences(window, cx);
@@ -1610,9 +1628,7 @@ impl Ashell {
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
-                    let local_path = title
-                        .strip_prefix("ASHELL_CWD_B64:")
-                        .and_then(crate::session::decode_local_path_title);
+                    let local_path = crate::session::parse_local_directory_title(&title);
                     if let Some(path) = local_path {
                         self.apply_local_directory_change(&tab_id, path);
                     } else if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
