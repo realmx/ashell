@@ -295,24 +295,15 @@ impl Ashell {
                             .unwrap_or_else(initial_local_title);
                         let backend_events =
                             crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
-                        let backend = match local::spawn_local_terminal_at(
+                        // The restored pane does not have reliable dimensions until its
+                        // first layout pass. Starting the shell now at DEFAULT_COLS would
+                        // make zsh redraw its prompt after the real PTY resize.
+                        let mut tab = TerminalTab::new_local(
                             id.clone(),
-                            DEFAULT_COLS,
-                            DEFAULT_ROWS,
-                            backend_events.clone(),
-                            cwd.as_deref(),
-                        ) {
-                            Ok(backend) => backend,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "[session] failed to restore local tab '{}': {err:#}",
-                                    id
-                                );
-                                continue;
-                            }
-                        };
-                        let mut tab =
-                            TerminalTab::new_local(id.clone(), title, backend, backend_events);
+                            title,
+                            crate::terminal::BackendTx::Pending,
+                            backend_events,
+                        );
                         tab.local_cwd = cwd;
                         tab.set_text_encoding(terminal_encoding);
                         (id, tab)
@@ -486,7 +477,11 @@ impl Ashell {
             return None;
         }
 
-        if self.tabs[tab_index].cols == cols && self.tabs[tab_index].rows == rows {
+        let backend_start_pending = self.tabs[tab_index].backend_start_pending();
+        if !backend_start_pending
+            && self.tabs[tab_index].cols == cols
+            && self.tabs[tab_index].rows == rows
+        {
             self.pending_local_terminal_resizes.remove(tab_id);
             if self.pending_local_terminal_resizes.is_empty() {
                 self.local_terminal_resize_task = None;
@@ -508,22 +503,71 @@ impl Ashell {
             let _ = this.update(cx, |this, cx| {
                 let pending = std::mem::take(&mut this.pending_local_terminal_resizes);
                 this.local_terminal_resize_task = None;
-                let mut resized = false;
+                let mut changed = false;
                 for (tab_id, (cols, rows)) in pending {
-                    if let Some(tab) = this
+                    let Some(tab_index) = this
                         .tabs
-                        .iter_mut()
-                        .find(|tab| tab.id == tab_id && tab.kind == TabKind::Local)
-                    {
-                        resized |= tab.resize(cols, rows);
+                        .iter()
+                        .position(|tab| tab.id == tab_id && tab.kind == TabKind::Local)
+                    else {
+                        continue;
+                    };
+
+                    if this.tabs[tab_index].backend_start_pending() {
+                        changed |= this.start_pending_local_terminal(tab_index, cols, rows);
+                    } else {
+                        changed |= this.tabs[tab_index].resize(cols, rows);
                     }
                 }
-                if resized {
+                if changed {
                     cx.notify();
                 }
             });
         }));
         None
+    }
+
+    /// Starts a restored local shell only after its pane has a stable grid size.
+    fn start_pending_local_terminal(&mut self, tab_index: usize, cols: u16, rows: u16) -> bool {
+        if !self.tabs[tab_index].backend_start_pending() {
+            return false;
+        }
+
+        // Resize the emulator before spawning the shell so its first output is
+        // interpreted with exactly the same dimensions as the PTY.
+        self.tabs[tab_index].resize(cols, rows);
+        let tab_id = self.tabs[tab_index].id.clone();
+        let local_cwd = self.tabs[tab_index]
+            .local_cwd
+            .clone()
+            .or_else(default_local_directory);
+        let backend_events = self.tabs[tab_index].backend_events();
+
+        match local::spawn_local_terminal_at(
+            tab_id.clone(),
+            cols,
+            rows,
+            backend_events,
+            local_cwd.as_deref(),
+        ) {
+            Ok(backend) => {
+                self.tabs[tab_index].set_backend(backend);
+                self.tabs[tab_index].connected = true;
+                self.tabs[tab_index].status = "local shell".into();
+                self.tabs[tab_index].disconnected_reason = None;
+                self.tabs[tab_index].local_cwd = local_cwd;
+            }
+            Err(err) => {
+                let reason = format!("failed to restore local terminal: {err:#}");
+                tracing::warn!("[session] {reason}");
+                self.tabs[tab_index].connected = false;
+                self.tabs[tab_index].status = reason.clone();
+                self.tabs[tab_index].disconnected_reason = Some(reason.clone());
+                self.status = reason.into();
+            }
+        }
+
+        true
     }
 
     pub(crate) fn open_local(&mut self, cx: &mut Context<Self>) {
