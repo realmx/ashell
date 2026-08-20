@@ -822,6 +822,7 @@ pub struct TerminalTab {
     pub rows: u16,
     pub backend: std::sync::Arc<std::sync::Mutex<BackendTx>>,
     backend_events: GuardedBackendEventSender,
+    should_cleanup_initial_blank_scrollback: bool,
     pub scroll_pixel_y: f32,
     pub(crate) highlight_cache: HighlightCache,
 }
@@ -1106,6 +1107,42 @@ mod terminal_tab_backend_tests {
         let (backend_tx, _backend_rx) = std::sync::mpsc::channel();
         tab.set_backend(BackendTx::Local(backend_tx));
         assert!(!tab.backend_start_pending());
+    }
+
+    #[test]
+    fn clears_blank_scrollback_created_during_local_terminal_startup() {
+        let (events_tx, _events_rx) = std::sync::mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+        tab.should_cleanup_initial_blank_scrollback = true;
+        tab.resize(10, 2);
+
+        tab.feed(b"\r\n\r\n\r\n");
+
+        assert_eq!(tab.render_snapshot(false).history_size, 0);
+        assert!(tab.should_cleanup_initial_blank_scrollback);
+    }
+
+    #[test]
+    fn preserves_non_blank_scrollback_created_during_local_terminal_startup() {
+        let (events_tx, _events_rx) = std::sync::mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+        tab.should_cleanup_initial_blank_scrollback = true;
+        tab.resize(10, 2);
+
+        tab.feed(b"first\r\nsecond\r\nthird");
+
+        assert!(tab.render_snapshot(false).history_size > 0);
+        assert!(!tab.should_cleanup_initial_blank_scrollback);
     }
 }
 
@@ -1520,6 +1557,7 @@ impl TerminalTab {
             rows: 30,
             backend: shared_backend,
             backend_events,
+            should_cleanup_initial_blank_scrollback: cfg!(windows) && kind == TabKind::Local,
             scroll_pixel_y: 0.0,
             highlight_cache: std::cell::RefCell::new(None),
         }
@@ -1553,7 +1591,31 @@ impl TerminalTab {
             }
         }
         self.processor.advance(&mut self.term, &decoded);
+        self.cleanup_initial_blank_scrollback();
         notifications
+    }
+
+    /// Drops ConPTY startup artifacts without removing real terminal output.
+    fn cleanup_initial_blank_scrollback(&mut self) -> bool {
+        if !self.should_cleanup_initial_blank_scrollback {
+            return false;
+        }
+
+        let history_size = self.term.grid().history_size();
+        if history_size == 0 {
+            return false;
+        }
+
+        let history_is_blank =
+            (1..=history_size).all(|offset| self.term.grid()[Line(-(offset as i32))].is_clear());
+        if !history_is_blank {
+            self.should_cleanup_initial_blank_scrollback = false;
+            return false;
+        }
+
+        self.term.grid_mut().clear_history();
+        self.scroll_pixel_y = 0.0;
+        true
     }
 
     pub(crate) fn is_command_active(&self) -> bool {
@@ -1675,6 +1737,7 @@ impl TerminalTab {
                 self.rows
             );
             self.term.resize(TerminalSize::new(self.cols, self.rows));
+            self.cleanup_initial_blank_scrollback();
             self.send_backend(BackendCommand::Resize { cols, rows });
             true
         } else {
