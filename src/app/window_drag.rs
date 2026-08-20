@@ -1,18 +1,18 @@
 //! Window dragging helpers for the integrated title bar.
 //!
 //! GPUI implements `Window::start_window_move` on macOS and Linux, but the
-//! Windows backend leaves it as a no-op. On Windows we drive the native move
-//! loop ourselves with `WM_SYSCOMMAND` / `SC_MOVE | HTCAPTION`, which tells
-//! `DefWindowProc` to begin moving from the current title-bar pointer press.
+//! Windows backend leaves it as a no-op. On Windows we post a native
+//! `WM_SYSCOMMAND` / `SC_MOVE | HTCAPTION` message so the GPUI pointer callback
+//! can finish before `DefWindowProc` enters its modal window-move loop.
 
 /// Begin a native window drag from a mouse-down on the integrated title bar.
 pub(crate) fn start_window_drag(window: &gpui::Window) {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Foundation::{HWND, WPARAM};
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
         use windows::Win32::UI::WindowsAndMessaging::{
-            HTCAPTION, SC_MOVE, SendMessageW, WM_SYSCOMMAND,
+            HTCAPTION, PostMessageW, SC_MOVE, WM_SYSCOMMAND,
         };
 
         let Some(handle) = crate::desktop_notification::native_window_handle(window) else {
@@ -24,12 +24,14 @@ pub(crate) fn start_window_drag(window: &gpui::Window) {
             // The button-down capture must be released before the system move
             // loop can take over the pointer.
             let _ = ReleaseCapture();
-            SendMessageW(
+            if let Err(err) = PostMessageW(
                 HWND(handle as _),
                 WM_SYSCOMMAND,
                 WPARAM((SC_MOVE | HTCAPTION) as usize),
-                None,
-            );
+                LPARAM(0),
+            ) {
+                tracing::warn!("failed to start native window drag: {err}");
+            }
         }
     }
 
