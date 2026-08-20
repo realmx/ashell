@@ -5,11 +5,13 @@ use gpui_component_assets::Assets;
 
 mod app;
 mod backend;
+mod desktop_notification;
 mod session;
 mod sftp;
 mod sync;
 mod system;
 mod terminal;
+mod text_encoding;
 
 rust_i18n::i18n!("locales", fallback = "en");
 
@@ -17,8 +19,11 @@ gpui::actions!(ashell_terminal, [TerminalTabKey, TerminalBacktabKey]);
 
 pub(crate) use app::keybinding_recorder::{
     ClosePane, Copy, FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, NewSsh, OpenSearch,
-    OpenSession, OpenSettings, OpenTransfers, Paste, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
-    SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
+    OpenSession, OpenSettings, OpenTransfers, Paste, QuitApplication, SplitPaneDown, SplitPaneLeft,
+    SplitPaneRight, SplitPaneUp, ToggleSftpZoom, ToggleSidebar,
+};
+pub(crate) use app::system_menu::{
+    AboutAshell, CloseWindow, MinimizeWindow, NewLocalTerminal, ToggleFullScreen, ZoomWindow,
 };
 
 pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, TabGroup};
@@ -26,6 +31,7 @@ pub(crate) use app::{Ashell, PaneLayout, SelectorEntry, SftpContextMenuState, Ta
 fn main() {
     app::startup::sync_macos_launch_environment();
     app::startup::init_logging();
+    desktop_notification::initialize();
 
     #[cfg(target_os = "macos")]
     let app = gpui_platform::application()
@@ -42,6 +48,9 @@ fn main() {
     });
     app.run(move |cx| {
         gpui_component::init(cx);
+        app::system_menu::init(cx);
+        cx.on_action(|_: &QuitApplication, cx| cx.quit());
+
         cx.bind_keys([
             KeyBinding::new(
                 "tab",

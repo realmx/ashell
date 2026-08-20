@@ -156,6 +156,19 @@ pub struct TerminalElement {
     search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
 }
 
+pub(crate) struct TerminalElementConfig {
+    pub(crate) view: Entity<Ashell>,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) snapshot: RenderSnapshot,
+    pub(crate) marked_text: Option<String>,
+    pub(crate) font_family: SharedString,
+    pub(crate) font_size: Pixels,
+    pub(crate) line_height: Pixels,
+    pub(crate) cell_width: Pixels,
+    pub(crate) tab_id: String,
+    pub(crate) search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
+}
+
 pub struct PrepaintState {
     bounds: Bounds<Pixels>,
     metrics: TerminalMetrics,
@@ -284,18 +297,19 @@ impl InputHandler for TerminalInputHandler {
 }
 
 impl TerminalElement {
-    pub fn new(
-        view: Entity<Ashell>,
-        focus_handle: FocusHandle,
-        snapshot: RenderSnapshot,
-        marked_text: Option<String>,
-        font_family: SharedString,
-        font_size: Pixels,
-        line_height: Pixels,
-        cell_width: Pixels,
-        tab_id: String,
-        search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
-    ) -> Self {
+    pub(crate) fn new(config: TerminalElementConfig) -> Self {
+        let TerminalElementConfig {
+            view,
+            focus_handle,
+            snapshot,
+            marked_text,
+            font_family,
+            font_size,
+            line_height,
+            cell_width,
+            tab_id,
+            search_highlights,
+        } = config;
         Self {
             view,
             focus_handle,
@@ -600,32 +614,26 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let _ = self.base_text_style(cx);
-        let (rects, runs, custom_blocks, underlines) = self.layout_grid(cx);
 
-        // Save the precise GPUI-rendered bounds of this terminal element.
-        // This is 100% accurate because it is recorded during layout prepaint.
+        // Local window animations emit many intermediate sizes. The view
+        // coalesces those requests before resizing its terminal grid and PTY.
         let view = self.view.clone();
         let tab_id = self.tab_id.clone();
-        let _ = view.update(cx, |this, cx| {
-            let old_bounds = this.terminal_bounds.insert(tab_id.clone(), bounds);
-
-            // Sync PTY size unconditionally on every prepaint layout pass to ensure
-            // absolute synchronization with GPUI layout regardless of intermediate events.
-            let line_height = this.terminal_line_height();
-            let cell_width = this.terminal_cell_width();
-            let w = bounds.size.width.as_f32();
-            let h = bounds.size.height.as_f32();
-            let cols = (w / cell_width).floor().max(1.0) as u16;
-            let rows = (h / line_height).floor().max(1.0) as u16;
-
-            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                tab.resize(cols, rows);
-            }
-
-            if old_bounds != Some(bounds) {
-                cx.notify();
-            }
+        let cols = (bounds.size.width.as_f32() / self.cell_width.as_f32())
+            .floor()
+            .max(1.0) as u16;
+        let rows = (bounds.size.height.as_f32() / self.line_height.as_f32())
+            .floor()
+            .max(1.0) as u16;
+        let resized_snapshot = view.update(cx, |this, cx| {
+            this.terminal_bounds.insert(tab_id.clone(), bounds);
+            this.resize_terminal_for_layout(&tab_id, cols, rows, cx)
         });
+        if let Some(snapshot) = resized_snapshot {
+            self.snapshot = snapshot;
+        }
+
+        let (rects, runs, custom_blocks, underlines) = self.layout_grid(cx);
 
         PrepaintState {
             bounds,

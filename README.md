@@ -20,7 +20,11 @@ v0.4 在 v0.3 打下的基础上，重点带来了更完整的工作区操作能
 
 ## 下载
 
-您可以从 [GitHub Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载 macOS、Windows 和 Linux 版本的最新预编译程序。
+您可以从 [GitHub Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载最新安装包：
+
+- macOS：x64 和 arm64 的 `.dmg`，同时提供便携 `.zip`。
+- Windows：x64、x86 和 arm64 的 `Setup.exe`，同时提供便携 `.zip`。
+- Linux：x64 便携 `.tar.gz`。
 
 ## Mac 安装指南
 
@@ -43,13 +47,26 @@ brew upgrade ashell --cask
 
 ### 方法 2: 手动下载
 
-1. 从 [Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载并解压。
-2. 将 `ashell.app` 拖入或移动到 **应用程序 (Applications)** 目录。
+1. 从 [Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载与处理器匹配的 `.dmg`。
+2. 打开 DMG，将 `ashell.app` 拖入 **Applications** 目录。
 3. 由于应用采用本地签名，初次启动时如果系统提示“App 已损坏，无法打开”，请打开终端（Terminal）并执行以下命令：
 
 ```bash
 sudo xattr -cr /Applications/ashell.app
 ```
+
+## Windows 安装指南
+
+从 [Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载对应安装程序：
+
+| 系统架构 | 安装包名称后缀 |
+| --- | --- |
+| Intel/AMD 64 位 | `windows-x64-setup.exe` |
+| Intel/AMD 32 位 | `windows-x86-setup.exe` |
+| Windows on ARM | `windows-arm64-setup.exe` |
+
+运行安装程序后，可选择是否创建桌面快捷方式；应用也会出现在开始菜单和系统卸载列表中。
+当前安装包尚未使用商业代码签名证书，Windows SmartScreen 可能显示安全提醒。
 
 ## 功能特性
 
@@ -72,6 +89,35 @@ sudo xattr -cr /Applications/ashell.app
 ```bash
 cargo run --release
 ```
+
+## 终端通知与任务提醒
+
+ashell 支持 [OSC 9](https://iterm2.com/documentation-escape-codes.html)、
+[OSC 99](https://sw.kovidgoyal.net/kitty/desktop-notifications/)、
+[OSC 777](https://wezterm.org/escape-sequences.html) 和终端响铃（BEL），通知能力不绑定
+Codex 或其它特定工具。只要 CLI、脚本或远程程序发送受支持的终端控制序列，本地终端、
+SSH 和串口标签页都会将其转换为 macOS 或 Windows 系统通知，无需修改工具配置或伪装
+其它终端。
+
+OSC 9 携带通知正文；OSC 777 和 OSC 99 可以同时携带标题与正文，OSC 99 还支持
+`always`、`unfocused` 和 `invisible` 显示时机。BEL 本身不含正文，因此仅显示通用提醒，
+不会读取或推断当前终端画面中的内容。
+
+未读通知会在 macOS Dock 或 Windows 任务栏图标上显示红色徽标，切回对应标签后自动
+清除。标签标题左侧的 Loading 动画优先识别 OSC 133/633 shell integration 的命令开始
+和结束标记；未提供协议标记时根据近期终端输出活动回退显示。
+
+可以分别使用下面的命令测试四种提醒：
+
+```bash
+sleep 3; printf '\033]9;Task completed\007'
+sleep 3; printf '\033]777;notify;Deploy;Production is ready\033\\'
+sleep 3; printf '\033]99;i=ashell-test:d=0;Build completed\033\\'; printf '\033]99;i=ashell-test:p=body;Artifacts are ready\033\\'
+sleep 3; printf '\007'
+```
+
+执行后在 3 秒内切换到其他应用。macOS 第一次收到通知时可能会询问权限；如果仍未显示，
+请在“系统设置 > 通知 > ashell”中确认已允许通知。
 
 ## 打包 macOS 应用
 

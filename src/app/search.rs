@@ -2,17 +2,18 @@ use std::collections::HashMap;
 
 use gpui::{
     Context, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px, rems,
+    ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    h_flex,
-    input::Input,
+    button::ButtonVariants as _, h_flex, input::Input,
 };
 use rust_i18n::t;
 
-use crate::Ashell;
+use crate::{
+    Ashell,
+    app::controls::{pointer_button, ui_rems},
+};
 
 impl Ashell {
     pub(crate) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -272,9 +273,7 @@ impl Ashell {
 
         let tab = tab.or_else(|| self.tabs.first());
 
-        let Some(tab) = tab else {
-            return None;
-        };
+        let tab = tab?;
         let snapshot = tab.render_snapshot(false);
         let display_offset = snapshot.display_offset as i32;
         let rows = snapshot.rows as i32;
@@ -327,10 +326,8 @@ impl Ashell {
     pub(crate) fn render_search_button(&self, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         // Wrap in a div so .hover() doesn't conflict with Button's internal hover.
         div().child(
-            Button::new("search-btn")
+            pointer_button("search-btn")
                 .ghost()
-                .small()
-                .rounded(px(999.))
                 .icon(IconName::Search)
                 .tooltip(t!("search").to_string())
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -362,7 +359,7 @@ impl Ashell {
             .top(px(8.))
             .right(px(24.))
             .on_prepaint(move |bounds, _window, cx| {
-                let _ = view.update(cx, |this, _| {
+                view.update(cx, |this, _| {
                     this.search_bar_bounds = Some(bounds);
                 });
             })
@@ -394,12 +391,12 @@ impl Ashell {
                                     }
                                 },
                             ))
-                            .child(Input::new(&self.search_input).small()),
+                            .child(Input::new(&self.search_input)),
                     )
                     .when(!current_display.is_empty(), |this| {
                         this.child(
                             div()
-                                .text_size(rems(0.75))
+                                .text_size(ui_rems(0.75))
                                 .text_color(cx.theme().muted_foreground)
                                 .min_w(px(36.))
                                 .text_center()
@@ -407,9 +404,9 @@ impl Ashell {
                         )
                     })
                     .child(
-                        Button::new("search-prev")
+                        pointer_button("search-prev")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::ChevronUp)
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -417,9 +414,9 @@ impl Ashell {
                             })),
                     )
                     .child(
-                        Button::new("search-next")
+                        pointer_button("search-next")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::ChevronDown)
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -427,9 +424,9 @@ impl Ashell {
                             })),
                     )
                     .child(
-                        Button::new("search-close")
+                        pointer_button("search-close")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::Close)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_search(window, cx);
