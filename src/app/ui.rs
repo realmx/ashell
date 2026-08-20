@@ -4290,15 +4290,6 @@ impl Ashell {
                             .flex_1()
                             .min_w(px(0.))
                             .h_full()
-                            .when(
-                                self.active_title_bar_style
-                                    == crate::session::config::TitleBarStyle::Integrated,
-                                |this| {
-                                    this.on_mouse_down(MouseButton::Left, |_, window, _| {
-                                        crate::app::window_drag::start_window_drag(window);
-                                    })
-                                },
-                            )
                             .overflow_x_hidden()
                             .child({
                                 h_flex()
@@ -4455,7 +4446,6 @@ impl Ashell {
                                                         ),
                                                 )
                                                 .cursor_pointer()
-                                                .block_mouse_except_scroll()
                                                 .on_mouse_down(MouseButton::Left, |_, window, _| {
                                                     window.prevent_default();
                                                 })
@@ -5024,6 +5014,7 @@ impl Ashell {
                         terminal::element::TerminalElementConfig {
                             view: cx.entity(),
                             focus_handle,
+                            pane_focused: is_focused,
                             snapshot,
                             marked_text,
                             font_family,
@@ -5555,6 +5546,35 @@ impl Render for Ashell {
                                 .flex_1()
                                 .min_w(px(0.))
                                 .h_full()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, _| {
+                                        this.should_move_window = true;
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, _| {
+                                        this.should_move_window = false;
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, _| {
+                                        this.should_move_window = false;
+                                    }),
+                                )
+                                .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                                    this.should_move_window = false;
+                                }))
+                                .on_mouse_move(cx.listener(|this, _, window, _| {
+                                    if this.should_move_window {
+                                        // Preserve clicks and enter the native move loop only
+                                        // after dragging starts within the integrated top bar.
+                                        this.should_move_window = false;
+                                        crate::app::window_drag::start_window_drag(window);
+                                    }
+                                }))
                                 .on_double_click(|_, window, _| {
                                     #[cfg(target_os = "macos")]
                                     window.titlebar_double_click();

@@ -146,6 +146,7 @@ struct CursorLayout {
 pub struct TerminalElement {
     view: Entity<Ashell>,
     focus_handle: FocusHandle,
+    pane_focused: bool,
     snapshot: RenderSnapshot,
     marked_text: Option<String>,
     font_family: SharedString,
@@ -159,6 +160,7 @@ pub struct TerminalElement {
 pub(crate) struct TerminalElementConfig {
     pub(crate) view: Entity<Ashell>,
     pub(crate) focus_handle: FocusHandle,
+    pub(crate) pane_focused: bool,
     pub(crate) snapshot: RenderSnapshot,
     pub(crate) marked_text: Option<String>,
     pub(crate) font_family: SharedString,
@@ -301,6 +303,7 @@ impl TerminalElement {
         let TerminalElementConfig {
             view,
             focus_handle,
+            pane_focused,
             snapshot,
             marked_text,
             font_family,
@@ -313,6 +316,7 @@ impl TerminalElement {
         Self {
             view,
             focus_handle,
+            pane_focused,
             snapshot,
             marked_text,
             font_family,
@@ -535,7 +539,15 @@ impl TerminalElement {
         )
     }
 
-    fn cursor_layout(&self, cx: &App) -> Option<CursorLayout> {
+    fn cursor_layout(&self, window: &Window, cx: &App) -> Option<CursorLayout> {
+        if !should_render_cursor(
+            window.is_window_active(),
+            self.focus_handle.is_focused(window),
+            self.pane_focused,
+        ) {
+            return None;
+        }
+
         use crate::session::config::CursorStyle;
         let cursor_style = self.view.read(cx).cursor_style;
         let show_cursor = match cursor_style {
@@ -569,6 +581,10 @@ impl TerminalElement {
             }
         })
     }
+}
+
+fn should_render_cursor(window_active: bool, terminal_focused: bool, pane_focused: bool) -> bool {
+    window_active && terminal_focused && pane_focused
 }
 
 impl IntoElement for TerminalElement {
@@ -610,7 +626,7 @@ impl Element for TerminalElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         let _ = self.base_text_style(cx);
@@ -644,7 +660,7 @@ impl Element for TerminalElement {
             rects,
             runs,
             custom_blocks,
-            cursor: self.cursor_layout(cx),
+            cursor: self.cursor_layout(window, cx),
             underlines,
         }
     }
@@ -944,5 +960,18 @@ fn named_color(named: NamedColor, _foreground: bool, cx: &App) -> Hsla {
         NamedColor::DimMagenta => Hsla::from(rgb(0xb48ead)),
         NamedColor::DimCyan => Hsla::from(rgb(0x88c0d0)),
         NamedColor::DimWhite => Hsla::from(rgb(0xe5e9f0)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_render_cursor;
+
+    #[test]
+    fn renders_cursor_only_for_focused_pane_in_focused_terminal_window() {
+        assert!(should_render_cursor(true, true, true));
+        assert!(!should_render_cursor(false, true, true));
+        assert!(!should_render_cursor(true, false, true));
+        assert!(!should_render_cursor(true, true, false));
     }
 }

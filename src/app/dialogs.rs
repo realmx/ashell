@@ -3366,6 +3366,65 @@ impl Ashell {
 
                         let focus_handle = view.read(cx).focus_handle.clone();
 
+                        let terminal_group = cfg!(windows).then(|| {
+                            use crate::session::config::LocalTerminalShell;
+                            let shells = [
+                                LocalTerminalShell::WindowsPowerShell,
+                                LocalTerminalShell::PowerShell7,
+                                LocalTerminalShell::CommandPrompt,
+                                LocalTerminalShell::GitBash,
+                            ];
+                            SettingGroup::new()
+                                .title(t!("settings_group_terminal").to_string())
+                                .item(SettingItem::new(
+                                    t!("default_local_terminal").to_string(),
+                                    SettingField::render({
+                                        let view = view_clone_for_general.clone();
+                                        move |_, _window, cx| {
+                                            let current = view.read(cx).config.local_terminal_shell();
+                                            pointer_button("default-local-terminal-dropdown")
+                                                .icon(IconName::SquareTerminal)
+                                                .label(crate::session::local_terminal_shell_label(current))
+                                                .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                                    let view = view.clone();
+                                                    move |mut menu, window, _cx| {
+                                                        menu = menu.min_w(px(220.));
+                                                        for shell in shells {
+                                                            let checked = shell == current;
+                                                            let available =
+                                                                crate::backend::local::local_terminal_shell_available(shell);
+                                                            let label =
+                                                                crate::session::local_terminal_shell_label(shell);
+                                                            let label = if available {
+                                                                label
+                                                            } else {
+                                                                format!(
+                                                                    "{} ({})",
+                                                                    label,
+                                                                    t!("local_terminal_not_installed")
+                                                                )
+                                                            };
+                                                            menu = menu.item(
+                                                                PopupMenuItem::new(label)
+                                                                    .checked(checked)
+                                                                    .disabled(!available)
+                                                                    .on_click(window.listener_for(
+                                                                        &view,
+                                                                        move |this, _, _, cx| {
+                                                                            this.change_local_terminal_shell(shell, cx);
+                                                                        },
+                                                                    )),
+                                                            );
+                                                        }
+                                                        menu
+                                                    }
+                                                })
+                                                .into_any_element()
+                                        }
+                                    }),
+                                ))
+                        });
+
                         content.child(
                             div()
                                 .flex()
@@ -3629,6 +3688,7 @@ impl Ashell {
                                                     )
                                                 )
                                         )
+                                        .groups(terminal_group)
                                         .group(
                                             SettingGroup::new()
                                                 .title(t!("settings_group_font").to_string())
