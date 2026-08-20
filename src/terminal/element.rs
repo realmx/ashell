@@ -535,7 +535,11 @@ impl TerminalElement {
         )
     }
 
-    fn cursor_layout(&self, cx: &App) -> Option<CursorLayout> {
+    fn cursor_layout(&self, window: &Window, cx: &App) -> Option<CursorLayout> {
+        if !window.is_window_active() || !self.focus_handle.is_focused(window) {
+            return None;
+        }
+
         use crate::session::config::CursorStyle;
         let cursor_style = self.view.read(cx).cursor_style;
         let show_cursor = match cursor_style {
@@ -610,7 +614,7 @@ impl Element for TerminalElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         let _ = self.base_text_style(cx);
@@ -644,7 +648,7 @@ impl Element for TerminalElement {
             rects,
             runs,
             custom_blocks,
-            cursor: self.cursor_layout(cx),
+            cursor: self.cursor_layout(window, cx),
             underlines,
         }
     }

@@ -578,7 +578,7 @@ impl Ashell {
         None
     }
 
-    /// Starts a restored local shell only after its pane has a stable grid size.
+    /// Starts a local shell only after its pane has a stable grid size.
     fn start_pending_local_terminal(&mut self, tab_index: usize, cols: u16, rows: u16) -> bool {
         if !self.tabs[tab_index].backend_start_pending() {
             return false;
@@ -620,7 +620,7 @@ impl Ashell {
                 self.tabs[tab_index].local_cwd = local_cwd;
             }
             Err(err) => {
-                let reason = format!("failed to restore local terminal: {err:#}");
+                let reason = format!("failed to start local terminal: {err:#}");
                 tracing::warn!("[session] {reason}");
                 self.tabs[tab_index].connected = false;
                 self.tabs[tab_index].status = reason.clone();
@@ -639,51 +639,42 @@ impl Ashell {
         let backend_events =
             crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
         let (shell, fallback) = self.local_shell_for_launch();
-        match local::spawn_local_terminal_at(
+        let title = initial_local_title();
+        // ConPTY reflows startup output when resized, so wait for the first
+        // stable layout before spawning the shell at its final grid size.
+        let mut tab = TerminalTab::new_local(
             id.clone(),
-            DEFAULT_COLS,
-            DEFAULT_ROWS,
-            backend_events.clone(),
-            initial_directory.as_deref(),
-            shell,
-        ) {
-            Ok(backend) => {
-                let title = initial_local_title();
-                let mut tab =
-                    TerminalTab::new_local(id.clone(), title.clone(), backend, backend_events);
-                tab.local_cwd = initial_directory;
-                tab.set_text_encoding(self.config.local_terminal_encoding());
-                tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
-                self.tabs.push(tab);
-                self.active_tab = Some(id.clone());
-                self.pane_root = PaneLayout::Single(id.clone());
-                self.focused_pane_path = vec![];
-                let group_id = Uuid::new_v4().to_string();
-                self.tab_groups.push(TabGroup {
-                    id: group_id.clone(),
-                    title,
-                    pane_root: PaneLayout::Single(id),
-                    sftp: None,
-                    sftp_tab_id: None,
-                });
-                self.active_group = Some(group_id);
-                self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
-                self.sync_system_tab_to_active_group();
-                self.status = if fallback {
-                    t!(
-                        "local_terminal_shell_fallback",
-                        terminal = local_terminal_shell_label(shell)
-                    )
-                    .to_string()
-                    .into()
-                } else {
-                    "local terminal opened".into()
-                };
-            }
-            Err(err) => {
-                self.status = format!("failed to open local terminal: {err:#}").into();
-            }
-        }
+            title.clone(),
+            crate::terminal::BackendTx::Pending,
+            backend_events,
+        );
+        tab.local_cwd = initial_directory;
+        tab.set_text_encoding(self.config.local_terminal_encoding());
+        self.tabs.push(tab);
+        self.active_tab = Some(id.clone());
+        self.pane_root = PaneLayout::Single(id.clone());
+        self.focused_pane_path = vec![];
+        let group_id = Uuid::new_v4().to_string();
+        self.tab_groups.push(TabGroup {
+            id: group_id.clone(),
+            title,
+            pane_root: PaneLayout::Single(id),
+            sftp: None,
+            sftp_tab_id: None,
+        });
+        self.active_group = Some(group_id);
+        self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
+        self.sync_system_tab_to_active_group();
+        self.status = if fallback {
+            t!(
+                "local_terminal_shell_fallback",
+                terminal = local_terminal_shell_label(shell)
+            )
+            .to_string()
+            .into()
+        } else {
+            "local terminal opened".into()
+        };
         self.update_terminal_focus(previous_active_tab.as_deref());
         self.save_tabs_state_background();
         cx.notify();
@@ -2185,35 +2176,20 @@ impl Ashell {
             crate::terminal::GuardedBackendEventSender::new(self.events_tx.clone());
         let mut tab = match current_kind {
             TabKind::Local => {
-                match local::spawn_local_terminal_at(
+                let title = local_cwd
+                    .as_deref()
+                    .map(compact_local_path)
+                    .unwrap_or_else(initial_local_title);
+                // The split pane's dimensions are unknown until its first layout pass.
+                let mut tab = TerminalTab::new_local(
                     new_id.clone(),
-                    DEFAULT_COLS,
-                    DEFAULT_ROWS,
+                    title,
+                    crate::terminal::BackendTx::Pending,
                     backend_events.clone(),
-                    local_cwd.as_deref(),
-                    shell,
-                ) {
-                    Ok(backend) => {
-                        let title = local_cwd
-                            .as_deref()
-                            .map(compact_local_path)
-                            .unwrap_or_else(initial_local_title);
-                        let mut tab = TerminalTab::new_local(
-                            new_id.clone(),
-                            title,
-                            backend,
-                            backend_events.clone(),
-                        );
-                        tab.local_cwd = local_cwd;
-                        tab.set_text_encoding(self.config.local_terminal_encoding());
-                        tab
-                    }
-                    Err(err) => {
-                        self.status = format!("failed to split: {err:#}").into();
-                        cx.notify();
-                        return;
-                    }
-                }
+                );
+                tab.local_cwd = local_cwd;
+                tab.set_text_encoding(self.config.local_terminal_encoding());
+                tab
             }
             TabKind::Ssh => {
                 let Some(session) = current_session else {
