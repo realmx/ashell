@@ -4336,6 +4336,10 @@ impl Ashell {
                                                     }
                                                 })
                                                 .unwrap_or(cx.theme().success);
+                                            let has_unread_notification =
+                                                pane_ids.iter().any(|id| {
+                                                    self.unread_terminal_notifications.contains(id)
+                                                });
                                             let output_active = pane_ids.iter().any(|id| {
                                                 self.tabs
                                                     .iter()
@@ -4375,23 +4379,45 @@ impl Ashell {
                                                                 .size(px(12.))
                                                                 .items_center()
                                                                 .justify_center()
-                                                                .when(output_active, |this| {
-                                                                    this.child(
-                                                                        Spinner::new()
-                                                                            .small()
-                                                                            .color(
-                                                                                cx.theme().primary,
-                                                                            ),
-                                                                    )
-                                                                })
-                                                                .when(!output_active, |this| {
-                                                                    this.child(
-                                                                        div()
-                                                                            .size(px(6.))
-                                                                            .rounded_full()
-                                                                            .bg(dot_color),
-                                                                    )
-                                                                }),
+                                                                .when(
+                                                                    output_active
+                                                                        && !has_unread_notification,
+                                                                    |this| {
+                                                                        this.child(
+                                                                            Spinner::new()
+                                                                                .small()
+                                                                                .color(
+                                                                                    cx.theme()
+                                                                                        .primary,
+                                                                                ),
+                                                                        )
+                                                                    },
+                                                                )
+                                                                .when(
+                                                                    !output_active
+                                                                        && !has_unread_notification,
+                                                                    |this| {
+                                                                        this.child(
+                                                                            div()
+                                                                                .size(px(6.))
+                                                                                .rounded_full()
+                                                                                .bg(dot_color),
+                                                                        )
+                                                                    },
+                                                                )
+                                                                .when(
+                                                                    has_unread_notification,
+                                                                    |this| {
+                                                                        this.child(
+                                                                            div()
+                                                                                .size(px(7.))
+                                                                                .rounded_full()
+                                                                                .bg(cx
+                                                                                    .theme()
+                                                                                    .danger),
+                                                                        )
+                                                                    },
+                                                                ),
                                                         )
                                                         .child(
                                                             div()
@@ -5596,6 +5622,7 @@ impl Render for Ashell {
             )
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
             .when_some(self.sftp_context_menu.clone(), |this, menu| {
                 let download_label = if menu.is_dir {
                     t!("download_folder").to_string()

@@ -4,20 +4,32 @@ name: Release
 #  - Push a tag like `v0.2.3`  -> builds all platforms and attaches the archives
 #    to a GitHub Release.
 #  - Push a `build/**` branch -> builds preview installers as workflow artifacts.
-#  - Run manually (workflow_dispatch) -> builds all platforms and uploads them as
-#    downloadable workflow artifacts (no release created).
+#  - Run manually (workflow_dispatch) -> builds all platforms by default, or only
+#    the selected target, and uploads them as downloadable workflow artifacts.
 
 on:
   push:
     branches: ["build/**"]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: "Build target"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - windows-x64
 
 permissions:
   contents: write # needed to create / update the GitHub Release
 
 jobs:
   build:
+    if: >-
+      github.ref != 'refs/heads/build/windows-x64' &&
+      (github.event_name != 'workflow_dispatch' || inputs.platform == 'all')
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -242,6 +254,86 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows-x64:
+    if: >-
+      github.ref == 'refs/heads/build/windows-x64' ||
+      (github.event_name == 'workflow_dispatch' && inputs.platform == 'windows-x64')
+    name: windows-x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: Build (release)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Set package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$VERSION" ]; then
+            echo "Unable to read the package version from Cargo.toml" >&2
+            exit 1
+          fi
+          PACKAGE_VERSION="${VERSION}-dev.${GITHUB_SHA:0:7}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE_VERSION=$PACKAGE_VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE_BASENAME=ashell-v${PACKAGE_VERSION}-windows-x64" >> "$GITHUB_ENV"
+
+      - name: Package Windows installer and portable archive
+        shell: pwsh
+        env:
+          ASHELL_ARCH: x64
+          ASHELL_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\ashell.exe
+          ASHELL_OUTPUT_DIR: ${{ github.workspace }}\dist
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+
+          $isccCommand = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+          if ($null -ne $isccCommand) {
+            $iscc = $isccCommand.Source
+          } else {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler was not found"
+          }
+
+          & $iscc "packaging\windows\ashell.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+          $installer = "dist\${env:PACKAGE_BASENAME}-setup.exe"
+          if (-not (Test-Path $installer)) {
+            throw "Expected installer was not created: $installer"
+          }
+
+          $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_BASENAME
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item $env:ASHELL_BINARY_PATH (Join-Path $stage "ashell.exe")
+          Compress-Archive -Path $stage -DestinationPath "dist\${env:PACKAGE_BASENAME}-portable.zip"
+          Get-FileHash -Algorithm SHA256 "dist\*"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
           path: dist/*
           if-no-files-found: error
           retention-days: 14
