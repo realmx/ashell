@@ -16,7 +16,10 @@ use russh::{
     client::{self, Handler},
     keys::{PrivateKey, decode_secret_key, load_secret_key},
 };
-use russh_sftp::{client::SftpSession, protocol::FileAttributes};
+use russh_sftp::{
+    client::SftpSession,
+    protocol::{FileAttributes, OpenFlags},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{
@@ -1213,9 +1216,33 @@ async fn write_text_file_impl(sftp: &SftpSession, path: &str, content: &[u8]) ->
             .with_context(|| format!("preserve permissions for {path}"))?;
         }
 
-        sftp.rename(temporary_path.as_str(), path)
-            .await
-            .with_context(|| format!("replace remote {path}"))
+        match sftp.rename(temporary_path.as_str(), path).await {
+            Ok(()) => Ok(()),
+            Err(rename_error) => {
+                // Some SFTP servers reject replacing an existing path with the standard
+                // rename request. If the original file is still present, fall back to
+                // truncating it in place instead of deleting it before the write succeeds.
+                if sftp.metadata(path).await.is_err() {
+                    return Err(rename_error).with_context(|| format!("replace remote {path}"));
+                }
+
+                let mut remote_file = sftp
+                    .open_with_flags(path, OpenFlags::WRITE | OpenFlags::TRUNCATE)
+                    .await
+                    .with_context(|| format!("open remote {path} for overwrite"))?;
+                remote_file
+                    .write_all(content)
+                    .await
+                    .with_context(|| format!("write remote {path}"))?;
+                remote_file
+                    .flush()
+                    .await
+                    .with_context(|| format!("flush remote {path}"))?;
+                drop(remote_file);
+                let _ = sftp.remove_file(temporary_path.as_str()).await;
+                Ok(())
+            }
+        }
     }
     .await;
 
