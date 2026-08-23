@@ -102,12 +102,15 @@ notification_method = "osc9"
 notification_condition = "unfocused"
 ```
 
-When a task finishes while its tab is not visible, ashell shows a native notification. Unread
-notifications add a red badge to the macOS Dock icon or a red overlay to the Windows taskbar icon;
-viewing the corresponding tab clears it. The loading indicator beside a tab title prioritizes OSC
-133/633 shell-integration command lifecycle markers. Shells and CLI tools without those markers fall
-back to recent terminal output activity, while an OSC 9 completion notification clears the task's
-loading state immediately.
+When an eligible notification originates in the background or a non-visible tab, ashell shows a
+native notification and a flashing bell on the corresponding tab. Unread notifications also add a
+red badge to the macOS Dock icon or a red overlay to the Windows taskbar icon. Clicking the native
+notification activates ashell and switches to the originating terminal tab; viewing that tab clears
+its unread state. No reminder is shown when ashell is active and the notification originates in the
+currently visible tab. The loading indicator beside a tab title prioritizes OSC 133/633
+shell-integration command lifecycle markers. Shells and CLI tools without those markers fall back to
+recent terminal output activity, while an OSC 9 completion notification clears the task's loading
+state immediately.
 
 You can test a generic OSC 9 notification with:
 

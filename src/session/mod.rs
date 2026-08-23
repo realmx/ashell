@@ -1793,7 +1793,6 @@ impl Ashell {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let previous_active_tab = self.active_tab.clone();
         let active_tab_changed = previous_active_tab.as_deref() != Some(id.as_str());
@@ -1805,21 +1804,20 @@ impl Ashell {
         }
         self.active_tab = Some(id.clone());
         // Find which group this tab belongs to and restore its pane_root
-        let tab_group = self
+        let tab_group_index = self
             .tab_groups
-            .iter_mut()
-            .find(|g| g.pane_root.contains(&id));
-        if let Some(group) = tab_group {
+            .iter()
+            .position(|group| group.pane_root.contains(&id));
+        if let Some(index) = tab_group_index {
+            let group = &self.tab_groups[index];
             self.pane_root = group.pane_root.clone();
             self.active_group = Some(group.id.clone());
             // Focus the activated tab in the pane tree
             self.focus_pane_with_id(id.clone());
+            self.tabs_scroll_handle.scroll_to_item(index);
         } else {
             self.pane_root = PaneLayout::Single(id.clone());
             self.focused_pane_path = vec![];
-        }
-        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
-            self.tabs_scroll_handle.scroll_to_item(index);
         }
         if self.tabs.iter().any(|t| t.id == id) {
             if let Some(session_id) = self.active_session_id() {
@@ -1841,6 +1839,7 @@ impl Ashell {
         self.sync_sftp_to_active_tab();
         self.sync_system_tab_to_active_group();
         self.update_terminal_focus(previous_active_tab.as_deref());
+        self.save_tabs_state_background();
         if active_tab_changed {
             self.prompt_active_ssh_reconnect_if_needed(window, cx);
         }

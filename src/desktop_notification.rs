@@ -1,8 +1,16 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::{collections::VecDeque, sync::Mutex};
+
 #[cfg(target_os = "macos")]
 const APP_BUNDLE_ID: &str = "dev.ashell.app";
 
 #[cfg(target_os = "windows")]
 const APP_USER_MODEL_ID: &str = "dev.ashell.app";
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const MAX_PENDING_TERMINAL_NOTIFICATION_ACTIVATIONS: usize = 64;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static TERMINAL_NOTIFICATION_ACTIVATIONS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
 pub(crate) fn initialize() {
     #[cfg(target_os = "macos")]
@@ -27,53 +35,100 @@ pub(crate) fn initialize() {
     }
 }
 
-pub(crate) fn show_terminal_notification(title: String, body: String) {
+pub(crate) fn show_terminal_notification(tab_id: String, title: String, body: String) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Err(error) = std::thread::Builder::new()
         .name("desktop-notification".to_string())
-        .spawn(move || show_native_notification(&title, &body))
+        .spawn(move || show_native_notification(&title, &body, &tab_id))
     {
         tracing::warn!("failed to start desktop notification thread: {error}");
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (title, body);
+        let _ = (tab_id, title, body);
     }
 }
 
 #[cfg(target_os = "macos")]
-fn show_native_notification(title: &str, body: &str) {
-    let result = desktop_notify::Notification::new()
-        .summary(title)
-        .body(body)
-        .show();
+fn show_native_notification(title: &str, body: &str, tab_id: &str) {
+    let result = mac_notification_sys::Notification::new()
+        .title(title)
+        .message(body)
+        .wait_for_click(true)
+        .send();
     match result {
-        Ok(_) => tracing::info!("submitted terminal notification to macOS"),
+        Ok(mac_notification_sys::NotificationResponse::Click) => {
+            queue_terminal_notification_activation(tab_id.to_string());
+        }
+        Ok(_) => tracing::info!("terminal notification closed without activation on macOS"),
         Err(error) => tracing::warn!("failed to show macOS terminal notification: {error}"),
     }
 }
 
 #[cfg(target_os = "windows")]
-fn show_native_notification(title: &str, body: &str) {
-    let result = desktop_notify::Notification::new()
-        .appname("ashell")
-        .summary(title)
-        .body(body)
-        .app_id(APP_USER_MODEL_ID)
-        .show();
-    if result.is_ok() {
-        return;
+fn show_native_notification(title: &str, body: &str, tab_id: &str) {
+    match show_windows_notification(APP_USER_MODEL_ID, title, body, tab_id) {
+        Ok(()) => tracing::info!("submitted terminal notification to Windows"),
+        Err(primary_error) => {
+            if let Err(fallback_error) = show_windows_notification(
+                winrt_notification::Toast::POWERSHELL_APP_ID,
+                title,
+                body,
+                tab_id,
+            ) {
+                tracing::warn!(
+                    "failed to show Windows terminal notification: {primary_error}; fallback failed: {fallback_error}"
+                );
+            }
+        }
     }
+}
 
-    if let Err(error) = desktop_notify::Notification::new()
-        .appname("ashell")
-        .summary(title)
-        .body(body)
+#[cfg(target_os = "windows")]
+fn show_windows_notification(
+    app_id: &str,
+    title: &str,
+    body: &str,
+    tab_id: &str,
+) -> winrt_notification::Result<()> {
+    let activation_tab_id = tab_id.to_string();
+    winrt_notification::Toast::new(app_id)
+        .title(title)
+        .text2(body)
+        .duration(winrt_notification::Duration::Short)
+        .sound(None)
+        .on_activated(move || {
+            queue_terminal_notification_activation(activation_tab_id.clone());
+            Ok(())
+        })
         .show()
-    {
-        tracing::warn!("failed to show Windows terminal notification: {error}");
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn queue_terminal_notification_activation(tab_id: String) {
+    let Ok(mut activations) = TERMINAL_NOTIFICATION_ACTIVATIONS.lock() else {
+        tracing::warn!("failed to lock terminal notification activation queue");
+        return;
+    };
+    if activations.len() >= MAX_PENDING_TERMINAL_NOTIFICATION_ACTIVATIONS {
+        activations.pop_front();
     }
+    activations.push_back(tab_id);
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn take_terminal_notification_activation() -> Option<String> {
+    let Ok(mut activations) = TERMINAL_NOTIFICATION_ACTIVATIONS.lock() else {
+        tracing::warn!("failed to lock terminal notification activation queue");
+        return None;
+    };
+    activations.pop_front()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn take_terminal_notification_activation() -> Option<String> {
+    None
 }
 
 pub(crate) fn native_window_handle(window: &gpui::Window) -> Option<isize> {

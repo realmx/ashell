@@ -6,10 +6,11 @@ use std::{
 
 use crate::app::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui::{
-    Anchor, AppContext as _, Context, DismissEvent, ElementId, Empty, Focusable as _, FontWeight,
-    Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _,
-    PathBuilder, Pixels, Render, StatefulInteractiveElement as _, Styled as _, Window, canvas, div,
-    hsla, point, prelude::FluentBuilder as _, px, relative, uniform_list,
+    Anchor, Animation, AnimationExt as _, AppContext as _, Context, DismissEvent, ElementId, Empty,
+    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement as _, PathBuilder, Pixels, Render,
+    StatefulInteractiveElement as _, Styled as _, Window, bounce, canvas, div, ease_in_out, hsla,
+    point, prelude::FluentBuilder as _, px, relative, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt, Icon, IconName, InteractiveElementExt as _, Root,
@@ -41,6 +42,19 @@ use crate::{
     terminal::{self, TabKind, TerminalTab},
     text_encoding::TERMINAL_ENCODINGS,
 };
+
+fn flashing_terminal_notification_icon(tab_index: usize, color: Hsla) -> impl IntoElement {
+    Icon::new(IconName::Bell)
+        .xsmall()
+        .text_color(color)
+        .with_animation(
+            ("terminal-notification-bell", tab_index),
+            Animation::new(Duration::from_millis(800))
+                .repeat()
+                .with_easing(bounce(ease_in_out)),
+            |icon, delta| icon.opacity(0.25 + delta * 0.75),
+        )
+}
 
 fn process_matches_filter(process: &RemoteProcess, filter: &str) -> bool {
     if filter.is_empty() {
@@ -4409,12 +4423,10 @@ impl Ashell {
                                                                     has_unread_notification,
                                                                     |this| {
                                                                         this.child(
-                                                                            div()
-                                                                                .size(px(7.))
-                                                                                .rounded_full()
-                                                                                .bg(cx
-                                                                                    .theme()
-                                                                                    .danger),
+                                                                            flashing_terminal_notification_icon(
+                                                                                ix,
+                                                                                cx.theme().danger,
+                                                                            ),
                                                                         )
                                                                     },
                                                                 ),
