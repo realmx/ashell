@@ -34,7 +34,7 @@ use crate::{
         constants::{SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT, TERMINAL_SCROLLBAR_GUTTER},
         controls::{
             PointerClipboard, PointerSelectionCheckbox, SelectionState, pointer_button,
-            pointer_checkbox, ui_rems,
+            pointer_checkbox, pointer_switch, ui_rems,
         },
     },
     sftp::format_mtime,
@@ -3339,8 +3339,9 @@ impl Ashell {
         let connect_id = session.id.clone();
         let edit_id = session.id.clone();
         let delete_id = session.id.clone();
+        let management_mode = self.connection_management_mode;
         let is_active = active_session_id == Some(session.id.as_str());
-        let is_selected = self.selected_connection_ids.contains(&session.id);
+        let is_selected = management_mode && self.selected_connection_ids.contains(&session.id);
         let name = session.name.clone();
         let detail = self.session_detail(&session);
         let selection_id = session.id.clone();
@@ -3370,13 +3371,15 @@ impl Ashell {
             })
             .hover(|this| this.bg(cx.theme().secondary))
             .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    let selected = !this.selected_connection_ids.contains(&row_selection_id);
-                    this.toggle_connection_selection(row_selection_id.clone(), selected, cx);
-                }),
-            )
+            .when(management_mode, |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        let selected = !this.selected_connection_ids.contains(&row_selection_id);
+                        this.toggle_connection_selection(row_selection_id.clone(), selected, cx);
+                    }),
+                )
+            })
             .context_menu({
                 let view = cx.entity();
                 move |menu, window, _| {
@@ -3412,37 +3415,39 @@ impl Ashell {
                     .min_w(px(0.))
                     .items_center()
                     .gap_0()
-                    .child(
-                        h_flex()
-                            .w(px(16.))
-                            .mr_1()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .child(
-                                pointer_checkbox(ElementId::Name(
-                                    format!("connection-check-{selection_id}").into(),
-                                ))
-                                .checked(is_selected)
-                                .tab_stop(false)
-                                .on_click(cx.listener({
-                                    let selection_id = selection_id.clone();
-                                    move |this, checked, _, cx| {
-                                        this.toggle_connection_selection(
-                                            selection_id.clone(),
-                                            *checked,
-                                            cx,
-                                        );
-                                    }
-                                })),
-                            ),
-                    )
+                    .when(management_mode, |this| {
+                        this.child(
+                            h_flex()
+                                .w(px(16.))
+                                .mr_1()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    pointer_checkbox(ElementId::Name(
+                                        format!("connection-check-{selection_id}").into(),
+                                    ))
+                                    .checked(is_selected)
+                                    .tab_stop(false)
+                                    .on_click(cx.listener({
+                                        let selection_id = selection_id.clone();
+                                        move |this, checked, _, cx| {
+                                            this.toggle_connection_selection(
+                                                selection_id.clone(),
+                                                *checked,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -3505,16 +3510,21 @@ impl Ashell {
         } else {
             group.clone()
         };
+        let management_mode = self.connection_management_mode;
         let count = section.sessions.len();
         let group_session_ids = section
             .sessions
             .iter()
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
-        let selected_count = group_session_ids
-            .iter()
-            .filter(|session_id| self.selected_connection_ids.contains(*session_id))
-            .count();
+        let selected_count = if management_mode {
+            group_session_ids
+                .iter()
+                .filter(|session_id| self.selected_connection_ids.contains(*session_id))
+                .count()
+        } else {
+            0
+        };
         let selection_state = SelectionState::from_counts(selected_count, count);
         let has_sessions = !group_session_ids.is_empty();
         let select_group_session_ids = group_session_ids.clone();
@@ -3551,29 +3561,31 @@ impl Ashell {
                             this.toggle_connection_group(toggle_group.clone(), cx);
                         }),
                     )
-                    .child(
-                        h_flex()
-                            .w(px(16.))
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                PointerSelectionCheckbox::new(ElementId::Name(
-                                    format!("connection-group-check-{group_id}").into(),
-                                ))
-                                .state(selection_state)
-                                .disabled(!has_sessions)
-                                .on_click(cx.listener(
-                                    move |this, checked, _, cx| {
-                                        this.set_connection_selection(
-                                            select_group_session_ids.clone(),
-                                            *checked,
-                                            cx,
-                                        );
-                                    },
-                                )),
-                            ),
-                    )
+                    .when(management_mode, |this| {
+                        this.child(
+                            h_flex()
+                                .w(px(16.))
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    PointerSelectionCheckbox::new(ElementId::Name(
+                                        format!("connection-group-check-{group_id}").into(),
+                                    ))
+                                    .state(selection_state)
+                                    .disabled(!has_sessions)
+                                    .on_click(cx.listener(
+                                        move |this, checked, _, cx| {
+                                            this.set_connection_selection(
+                                                select_group_session_ids.clone(),
+                                                *checked,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                        )
+                    })
                     .child(
                         Icon::new(if collapsed {
                             IconName::ChevronRight
@@ -3691,6 +3703,7 @@ impl Ashell {
         } else {
             t!("no_matching_connections").to_string()
         };
+        let management_mode = self.connection_management_mode;
         let no_saved_connections = self.config.sessions().is_empty();
         let has_group_sections = !group_sections.is_empty();
         let visible_session_ids = group_sections
@@ -3699,7 +3712,8 @@ impl Ashell {
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
         let has_connections = !visible_session_ids.is_empty();
-        let all_connections_selected = has_connections
+        let all_connections_selected = management_mode
+            && has_connections
             && visible_session_ids
                 .iter()
                 .all(|id| self.selected_connection_ids.contains(id));
@@ -3708,9 +3722,9 @@ impl Ashell {
             .config
             .sessions()
             .iter()
-            .filter(|session| self.selected_connection_ids.contains(&session.id))
+            .filter(|session| management_mode && self.selected_connection_ids.contains(&session.id))
             .count();
-        let has_selected_connections = selected_connections > 0;
+        let has_selected_connections = management_mode && selected_connections > 0;
         let connection_groups = self.config.connection_groups();
         let saved_sessions_overflowing = self.saved_sessions_overflowing;
         let saved_sessions_scroll_handle = self.saved_scroll_handle.clone();
@@ -3798,36 +3812,40 @@ impl Ashell {
                             .gap_1()
                             .pl(px(5.))
                             .py(px(4.))
-                            .child(
-                                h_flex()
-                                    .w(px(16.))
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        pointer_checkbox("connections-select-all")
-                                            .checked(all_connections_selected)
-                                            .disabled(!has_connections)
-                                            .tab_stop(false)
-                                            .on_click(cx.listener({
-                                                let visible_session_ids =
-                                                    visible_session_ids.clone();
-                                                move |this, checked, _, cx| {
-                                                    this.set_connection_selection(
-                                                        visible_session_ids.clone(),
-                                                        *checked,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(ui_rems(0.75))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{selected_connections}/{total_connections}")),
-                            )
+                            .when(management_mode, |this| {
+                                this.child(
+                                    h_flex()
+                                        .w(px(16.))
+                                        .flex_none()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            pointer_checkbox("connections-select-all")
+                                                .checked(all_connections_selected)
+                                                .disabled(!has_connections)
+                                                .tab_stop(false)
+                                                .on_click(cx.listener({
+                                                    let visible_session_ids =
+                                                        visible_session_ids.clone();
+                                                    move |this, checked, _, cx| {
+                                                        this.set_connection_selection(
+                                                            visible_session_ids.clone(),
+                                                            *checked,
+                                                            cx,
+                                                        );
+                                                    }
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(ui_rems(0.75))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "{selected_connections}/{total_connections}"
+                                        )),
+                                )
+                            })
                             .child(div().flex_1())
                             .child(
                                 pointer_button("new-connection-group")
@@ -3839,18 +3857,19 @@ impl Ashell {
                                         this.show_connection_group_dialog(None, window, cx);
                                     })),
                             )
-                            .child({
-                                let groups = connection_groups.clone();
-                                pointer_button("move-selected-connections")
-                                    .ghost()
-                                    .icon(IconName::FolderClosed)
-                                    .label(t!("move_to_group").to_string())
-                                    .tooltip(t!("move_to_group").to_string())
-                                    .disabled(!has_selected_connections)
-                                    .dropdown_menu_with_anchor(Anchor::BottomRight, {
-                                        let view = cx.entity();
-                                        move |menu, window, _| {
-                                            let menu = menu.min_w(0.).item(
+                            .when(management_mode, |this| {
+                                this.child({
+                                    let groups = connection_groups.clone();
+                                    pointer_button("move-selected-connections")
+                                        .ghost()
+                                        .icon(IconName::FolderClosed)
+                                        .label(t!("move_to_group").to_string())
+                                        .tooltip(t!("move_to_group").to_string())
+                                        .disabled(!has_selected_connections)
+                                        .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                            let view = cx.entity();
+                                            move |menu, window, _| {
+                                                let menu = menu.min_w(0.).item(
                                                 PopupMenuItem::new(t!("ungrouped").to_string())
                                                     .on_click(window.listener_for(
                                                         &view,
@@ -3862,10 +3881,10 @@ impl Ashell {
                                                         },
                                                     )),
                                             );
-                                            groups.iter().fold(menu, |menu, group| {
-                                                let group = group.clone();
-                                                let label = group.clone();
-                                                menu.item(PopupMenuItem::new(label).on_click(
+                                                groups.iter().fold(menu, |menu, group| {
+                                                    let group = group.clone();
+                                                    let label = group.clone();
+                                                    menu.item(PopupMenuItem::new(label).on_click(
                                                     window.listener_for(
                                                         &view,
                                                         move |this, _, _, cx| {
@@ -3876,18 +3895,30 @@ impl Ashell {
                                                         },
                                                     ),
                                                 ))
-                                            })
-                                        }
-                                    })
+                                                })
+                                            }
+                                        })
+                                })
+                            })
+                            .when(management_mode, |this| {
+                                this.child(
+                                    pointer_button("delete-selected-connections")
+                                        .danger()
+                                        .icon(IconName::Delete)
+                                        .label(t!("delete_selected_connections").to_string())
+                                        .disabled(!has_selected_connections)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.remove_selected_sessions(cx);
+                                        })),
+                                )
                             })
                             .child(
-                                pointer_button("delete-selected-connections")
-                                    .danger()
-                                    .icon(IconName::Delete)
-                                    .label(t!("delete_selected_connections").to_string())
-                                    .disabled(!has_selected_connections)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.remove_selected_sessions(cx);
+                                pointer_switch("connection-management-mode")
+                                    .small()
+                                    .checked(management_mode)
+                                    .tooltip(t!("manage_connections").to_string())
+                                    .on_click(cx.listener(|this, checked, _, cx| {
+                                        this.set_connection_management_mode(*checked, cx);
                                     })),
                             ),
                     )
@@ -5443,7 +5474,7 @@ impl Render for Ashell {
                     .workspace_panels()
                     .and_then(|s| s.first().copied())
                     .unwrap_or(SIDEBAR_WIDTH)))
-                .size_range(px(240.)..px(520.))
+                .size_range(px(310.)..px(520.))
                 .flex_none()
                 .child(self.sidebar(cx));
 

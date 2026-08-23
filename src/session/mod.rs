@@ -1520,6 +1520,17 @@ impl Ashell {
         cx.notify();
     }
 
+    pub(crate) fn set_connection_management_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.connection_management_mode == enabled {
+            return;
+        }
+        self.connection_management_mode = enabled;
+        if !enabled {
+            self.selected_connection_ids.clear();
+        }
+        cx.notify();
+    }
+
     pub(crate) fn set_connection_selection(
         &mut self,
         session_ids: Vec<String>,
