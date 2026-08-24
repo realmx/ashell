@@ -44,6 +44,8 @@ use crate::{
     text_encoding::TextEncoding,
 };
 
+const SYSTEM_HISTORY_LIMIT: usize = 20;
+
 #[derive(Clone, Debug)]
 pub(crate) enum PaneLayout {
     Single(String),
@@ -62,10 +64,27 @@ pub(crate) struct TabGroup {
 
 impl PaneLayout {
     pub fn tab_ids(&self) -> Vec<&str> {
+        let mut tab_ids = Vec::new();
+        self.collect_tab_ids(&mut tab_ids);
+        tab_ids
+    }
+
+    fn collect_tab_ids<'a>(&'a self, tab_ids: &mut Vec<&'a str>) {
         match self {
-            PaneLayout::Single(id) => vec![id.as_str()],
+            PaneLayout::Single(id) => tab_ids.push(id),
             PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
-                children.iter().flat_map(|c| c.tab_ids()).collect()
+                for child in children {
+                    child.collect_tab_ids(tab_ids);
+                }
+            }
+        }
+    }
+
+    pub fn first_tab_id(&self) -> Option<&str> {
+        match self {
+            PaneLayout::Single(id) => Some(id),
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                children.iter().find_map(PaneLayout::first_tab_id)
             }
         }
     }
@@ -105,13 +124,12 @@ impl PaneLayout {
         }
     }
 
-    pub fn remove_tab(&mut self, tab_id: &str) -> bool {
+    pub fn remove_tab(&mut self, tab_id: &str) {
         match self {
             PaneLayout::Single(id) if id == tab_id => {
                 *self = PaneLayout::Single(String::new());
-                true
             }
-            PaneLayout::Single(_) => false,
+            PaneLayout::Single(_) => {}
             PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
                 for child in children.iter_mut() {
                     child.remove_tab(tab_id);
@@ -124,12 +142,10 @@ impl PaneLayout {
                         *self = replacement;
                     }
                 }
-                true
             }
         }
     }
 
-    #[allow(dead_code)]
     pub fn total_panes(&self) -> usize {
         match self {
             PaneLayout::Single(_) => 1,
@@ -154,6 +170,15 @@ fn should_show_terminal_notification(
         TerminalNotificationOccasion::Unfocused => !window_active,
         TerminalNotificationOccasion::Invisible => !terminal_visible,
     }
+}
+
+fn retain_unread_terminal_notifications(
+    unread: &mut HashSet<String>,
+    mut retain: impl FnMut(&str) -> bool,
+) -> bool {
+    let previous_count = unread.len();
+    unread.retain(|tab_id| retain(tab_id));
+    previous_count != unread.len()
 }
 
 pub(crate) struct TerminalScrollbarState {
@@ -358,7 +383,7 @@ pub(crate) struct Ashell {
     pub(crate) terminal_panel_bounds: Option<Bounds<Pixels>>,
     pub(crate) terminal_bounds: HashMap<String, Bounds<Pixels>>,
     pub(crate) terminal_selecting: bool,
-    pub(crate) dragging_splitter: Option<(Vec<usize>, usize)>, // (parent_path, child_index)
+    pub(crate) dragging_splitter: Option<Vec<usize>>,
     pub(crate) drag_split_origin: Option<gpui::Point<Pixels>>,
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
@@ -902,9 +927,9 @@ impl Ashell {
             keybind_error: None,
             keybinds_suspended: false,
             system,
-            cpu_history: Vec::with_capacity(20),
-            net_rx_history: Vec::with_capacity(20),
-            net_tx_history: Vec::with_capacity(20),
+            cpu_history: Vec::with_capacity(SYSTEM_HISTORY_LIMIT),
+            net_rx_history: Vec::with_capacity(SYSTEM_HISTORY_LIMIT),
+            net_tx_history: Vec::with_capacity(SYSTEM_HISTORY_LIMIT),
             last_system_sample: Instant::now(),
             last_theme_sync: Instant::now(),
 
@@ -1204,19 +1229,17 @@ impl Ashell {
                     .pane_root
                     .tab_ids()
                     .into_iter()
-                    .map(ToOwned::to_owned)
                     .collect::<HashSet<_>>()
             })
             .or_else(|| {
                 self.active_tab
-                    .as_ref()
-                    .map(|tab_id| HashSet::from([tab_id.clone()]))
+                    .as_deref()
+                    .map(|tab_id| HashSet::from([tab_id]))
             })
             .unwrap_or_default();
-        let previous_count = self.unread_terminal_notifications.len();
-        self.unread_terminal_notifications
-            .retain(|tab_id| !visible_tab_ids.contains(tab_id));
-        if previous_count != self.unread_terminal_notifications.len() {
+        if retain_unread_terminal_notifications(&mut self.unread_terminal_notifications, |tab_id| {
+            !visible_tab_ids.contains(tab_id)
+        }) {
             self.update_unread_indicator();
         }
     }
@@ -1225,12 +1248,11 @@ impl Ashell {
         let open_tab_ids = self
             .tabs
             .iter()
-            .map(|tab| tab.id.clone())
+            .map(|tab| tab.id.as_str())
             .collect::<HashSet<_>>();
-        let previous_count = self.unread_terminal_notifications.len();
-        self.unread_terminal_notifications
-            .retain(|tab_id| open_tab_ids.contains(tab_id));
-        if previous_count != self.unread_terminal_notifications.len() {
+        if retain_unread_terminal_notifications(&mut self.unread_terminal_notifications, |tab_id| {
+            open_tab_ids.contains(tab_id)
+        }) {
             self.update_unread_indicator();
         }
     }
@@ -1354,7 +1376,6 @@ impl Ashell {
                     if let Some(progress) = self.connection_progress.as_mut() {
                         if progress.tab_id == tab_id {
                             progress.lines.push(text.clone().into());
-                            let _idx = progress.lines.len().saturating_sub(1);
                             self.connection_scroll_handle
                                 .set_offset(gpui::point(px(0.), px(-99999.0)));
                         }
@@ -1465,19 +1486,7 @@ impl Ashell {
                     if self.is_connected_system_tab(&tab_id) {
                         self.remote_sample_in_flight = false;
                         self.system_status = None;
-                        self.system = snapshot.clone();
-                        self.cpu_history.push(snapshot.cpu_percent);
-                        if self.cpu_history.len() > 20 {
-                            self.cpu_history.remove(0);
-                        }
-                        self.net_rx_history.push(snapshot.net_rx_rate as f32);
-                        if self.net_rx_history.len() > 20 {
-                            self.net_rx_history.remove(0);
-                        }
-                        self.net_tx_history.push(snapshot.net_tx_rate as f32);
-                        if self.net_tx_history.len() > 20 {
-                            self.net_tx_history.remove(0);
-                        }
+                        self.apply_system_snapshot(snapshot);
                     }
                 }
                 BackendEvent::RemoteSystemUnavailable { tab_id, reason } => {
@@ -1560,16 +1569,7 @@ impl Ashell {
                         tab.disconnected_reason = Some(reason.clone());
                     }
                     if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
-                        self.system = SystemSnapshot::default();
-                        self.cpu_history.clear();
-                        self.net_rx_history.clear();
-                        self.net_tx_history.clear();
-                        self.remote_sample_in_flight = false;
-                        self.remote_processes_in_flight = false;
-                        self.remote_processes.clear();
-                        self.remote_ports_in_flight = false;
-                        self.remote_ports.clear();
-                        self.terminating_processes.clear();
+                        self.reset_system_monitor_state();
                         self.system_status = Some(reason.clone().into());
                         self.remote_process_status = Some(reason.clone().into());
                         self.remote_ports_status = Some(reason.clone().into());
@@ -1577,7 +1577,6 @@ impl Ashell {
                     if let Some(progress) = self.connection_progress.as_mut() {
                         if progress.tab_id == tab_id {
                             progress.lines.push(reason.clone().into());
-                            let _idx = progress.lines.len().saturating_sub(1);
                             self.connection_scroll_handle
                                 .set_offset(gpui::point(px(0.), px(-99999.0)));
                             progress.title = t!("connection_failed").into();
@@ -1587,7 +1586,6 @@ impl Ashell {
                     self.status = reason.into();
                 }
                 BackendEvent::TransferProgress {
-                    tab_id: _,
                     id,
                     transferred,
                     total,
@@ -1716,43 +1714,60 @@ impl Ashell {
     pub(crate) fn sample_system_if_due(&mut self) -> bool {
         if self.last_system_sample.elapsed() >= SystemSampler::interval() {
             self.last_system_sample = Instant::now();
-            if let Some(ref tab_id) = self.system_tab_id.clone() {
-                let ssh_connected = self
-                    .tabs
+            let ssh_connected = self.system_tab_id.as_deref().and_then(|tab_id| {
+                self.tabs
                     .iter()
-                    .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh)
-                    .map(|tab| tab.connected);
-                if let Some(connected) = ssh_connected {
-                    if connected {
-                        self.request_active_system_snapshot();
-                        if self.active_dialog == Some(DialogKind::Processes) {
-                            self.request_active_process_snapshot();
-                        }
-                        if self.active_dialog == Some(DialogKind::Ports) {
-                            self.request_active_port_snapshot();
-                        }
+                    .find(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh)
+                    .map(|tab| tab.connected)
+            });
+            if let Some(connected) = ssh_connected {
+                if connected {
+                    self.request_active_system_snapshot();
+                    if self.active_dialog == Some(DialogKind::Processes) {
+                        self.request_active_process_snapshot();
                     }
-                    return false;
+                    if self.active_dialog == Some(DialogKind::Ports) {
+                        self.request_active_port_snapshot();
+                    }
                 }
+                return false;
             }
             let snapshot = self.system_sampler.sample();
-            let cpu_usage = snapshot.cpu_percent;
-            self.cpu_history.push(cpu_usage);
-            if self.cpu_history.len() > 20 {
-                self.cpu_history.remove(0);
-            }
-            self.net_rx_history.push(snapshot.net_rx_rate as f32);
-            if self.net_rx_history.len() > 20 {
-                self.net_rx_history.remove(0);
-            }
-            self.net_tx_history.push(snapshot.net_tx_rate as f32);
-            if self.net_tx_history.len() > 20 {
-                self.net_tx_history.remove(0);
-            }
-            self.system = snapshot;
+            self.apply_system_snapshot(snapshot);
             return true;
         }
         false
+    }
+
+    fn apply_system_snapshot(&mut self, snapshot: SystemSnapshot) {
+        Self::push_system_history_sample(&mut self.cpu_history, snapshot.cpu_percent);
+        Self::push_system_history_sample(&mut self.net_rx_history, snapshot.net_rx_rate as f32);
+        Self::push_system_history_sample(&mut self.net_tx_history, snapshot.net_tx_rate as f32);
+        self.system = snapshot;
+    }
+
+    fn push_system_history_sample(history: &mut Vec<f32>, sample: f32) {
+        history.push(sample);
+        if history.len() > SYSTEM_HISTORY_LIMIT {
+            history.remove(0);
+        }
+    }
+
+    pub(crate) fn reset_system_monitor_state(&mut self) {
+        self.system = SystemSnapshot::default();
+        self.cpu_history.clear();
+        self.net_rx_history.clear();
+        self.net_tx_history.clear();
+        self.remote_sample_in_flight = false;
+        self.remote_processes_in_flight = false;
+        self.remote_processes.clear();
+        self.remote_ports_in_flight = false;
+        self.remote_ports.clear();
+        self.terminating_processes.clear();
+        self.system_status = None;
+        self.remote_process_status = None;
+        self.remote_ports_status = None;
+        self.expanded_process_pid = None;
     }
 
     pub(crate) fn sync_theme_if_due(&mut self, cx: &mut Context<Self>) {
@@ -1764,51 +1779,48 @@ impl Ashell {
     }
 
     pub(crate) fn request_active_system_snapshot(&mut self) {
-        let Some(ref tab_id) = self.system_tab_id.clone() else {
-            return;
-        };
-        let Some(backend) = (|| {
-            let tab = self.tabs.iter().find(|t| t.id == *tab_id)?;
-            if !tab.connected {
-                return None;
-            }
-            Some(tab.backend.clone())
-        })() else {
-            return;
-        };
         if self.remote_sample_in_flight {
             return;
         }
+        let Some(backend) = self
+            .active_connected_system_tab()
+            .map(|tab| tab.backend.clone())
+        else {
+            return;
+        };
         if let Ok(backend) = backend.lock() {
             self.remote_sample_in_flight = true;
             backend.send(crate::terminal::BackendCommand::SampleMetrics);
         }
     }
 
+    fn connected_system_tab(&self, tab_id: &str) -> Option<&TerminalTab> {
+        if self.system_tab_id.as_deref() != Some(tab_id) {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh && tab.connected)
+    }
+
+    fn active_connected_system_tab(&self) -> Option<&TerminalTab> {
+        self.connected_system_tab(self.system_tab_id.as_deref()?)
+    }
+
     fn is_connected_system_tab(&self, tab_id: &str) -> bool {
-        self.system_tab_id.as_deref() == Some(tab_id)
-            && self
-                .tabs
-                .iter()
-                .any(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh && tab.connected)
+        self.connected_system_tab(tab_id).is_some()
     }
 
     pub(crate) fn request_active_process_snapshot(&mut self) {
-        let Some(ref tab_id) = self.system_tab_id.clone() else {
-            return;
-        };
-        let Some(backend) = (|| {
-            let tab = self
-                .tabs
-                .iter()
-                .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh && tab.connected)?;
-            Some(tab.backend.clone())
-        })() else {
-            return;
-        };
         if self.remote_processes_in_flight {
             return;
         }
+        let Some(backend) = self
+            .active_connected_system_tab()
+            .map(|tab| tab.backend.clone())
+        else {
+            return;
+        };
         if let Ok(backend) = backend.lock() {
             self.remote_processes_in_flight = true;
             if self.remote_processes.is_empty() {
@@ -1819,21 +1831,15 @@ impl Ashell {
     }
 
     pub(crate) fn request_active_port_snapshot(&mut self) {
-        let Some(ref tab_id) = self.system_tab_id.clone() else {
-            return;
-        };
-        let Some(backend) = (|| {
-            let tab = self
-                .tabs
-                .iter()
-                .find(|tab| tab.id == *tab_id && tab.kind == TabKind::Ssh && tab.connected)?;
-            Some(tab.backend.clone())
-        })() else {
-            return;
-        };
         if self.remote_ports_in_flight {
             return;
         }
+        let Some(backend) = self
+            .active_connected_system_tab()
+            .map(|tab| tab.backend.clone())
+        else {
+            return;
+        };
         if let Ok(backend) = backend.lock() {
             self.remote_ports_in_flight = true;
             if self.remote_ports.is_empty() {
@@ -1882,16 +1888,10 @@ impl Ashell {
         if pid <= 1 || self.terminating_processes.contains(&pid) {
             return;
         }
-        if self.system_tab_id.as_deref() != Some(tab_id.as_str()) {
-            return;
-        }
-        let Some(backend) = (|| {
-            let tab = self
-                .tabs
-                .iter()
-                .find(|tab| tab.id == tab_id && tab.kind == TabKind::Ssh && tab.connected)?;
-            Some(tab.backend.clone())
-        })() else {
+        let Some(backend) = self
+            .connected_system_tab(&tab_id)
+            .map(|tab| tab.backend.clone())
+        else {
             return;
         };
         if let Ok(backend) = backend.lock() {
@@ -2281,8 +2281,35 @@ impl Ashell {
 }
 
 #[cfg(test)]
-mod terminal_notification_tests {
-    use super::{TerminalNotificationOccasion, should_show_terminal_notification};
+mod tests {
+    use super::{PaneLayout, TerminalNotificationOccasion, should_show_terminal_notification};
+
+    #[test]
+    fn pane_layout_queries_and_removes_tabs_in_display_order() {
+        let mut layout = PaneLayout::Horizontal(
+            vec![
+                PaneLayout::Single("first".to_string()),
+                PaneLayout::Vertical(
+                    vec![
+                        PaneLayout::Single("second".to_string()),
+                        PaneLayout::Single("third".to_string()),
+                    ],
+                    0.5,
+                ),
+            ],
+            0.5,
+        );
+
+        assert_eq!(layout.tab_ids(), vec!["first", "second", "third"]);
+        assert_eq!(layout.first_tab_id(), Some("first"));
+        assert_eq!(layout.total_panes(), 3);
+
+        layout.remove_tab("first");
+
+        assert_eq!(layout.tab_ids(), vec!["second", "third"]);
+        assert_eq!(layout.first_tab_id(), Some("second"));
+        assert_eq!(layout.total_panes(), 2);
+    }
 
     #[test]
     fn applies_terminal_notification_occasion_rules() {

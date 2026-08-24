@@ -679,8 +679,6 @@ pub enum BackendEvent {
         home: String,
     },
     TransferProgress {
-        #[allow(dead_code)]
-        tab_id: String,
         id: String,
         transferred: u64,
         total: Option<u64>,
@@ -1887,13 +1885,6 @@ impl TerminalTab {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
-    }
-
-    #[allow(dead_code)]
-    pub fn has_selection(&self) -> bool {
-        self.term
-            .selection_to_string()
-            .is_some_and(|text| !text.is_empty())
     }
 
     pub fn clear_selection(&mut self) {

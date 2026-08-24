@@ -645,7 +645,6 @@ impl Ashell {
         let selector_focus_handle = self.selector_focus_handle.clone();
         let deferred_selector_focus_handle = selector_focus_handle.clone();
         let sessions = self.config.sessions().to_vec();
-        let active_session_id = self.active_session_id().map(ToOwned::to_owned);
         self.selector_selection = self.default_selector_index();
         window.open_dialog(cx, move |dialog: Dialog, _window, _| {
             dialog
@@ -672,7 +671,6 @@ impl Ashell {
                 .content({
                     let view = view.clone();
                     let sessions = sessions.clone();
-                    let _active_session_id = active_session_id.clone();
                     let selector_focus_handle = selector_focus_handle.clone();
                     move |content, window, _cx| {
                         let selected_index = view.read(_cx).selector_selection;

@@ -523,7 +523,7 @@ impl Ashell {
         // Handle split drag
         if self.dragging_splitter.is_some() {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.on_split_drag_move(event, window, cx);
+                self.on_split_drag_move(event, window);
                 cx.notify();
             } else {
                 self.end_drag_split();

@@ -123,24 +123,16 @@ impl SystemSampler {
                 total_bytes: disk.total_space(),
             })
             .collect();
-        disks.sort_by(|a, b| {
-            if a.mount == "/" {
-                return std::cmp::Ordering::Less;
-            }
-            if b.mount == "/" {
-                return std::cmp::Ordering::Greater;
-            }
-            a.mount.cmp(&b.mount)
-        });
+        sort_disks(&mut disks);
 
         SystemSnapshot {
             cpu_percent,
             mem_percent: ratio(mem_used, mem_total),
             swap_percent: ratio(swap_used, swap_total),
-            mem_detail: format!("{}/{}", format_bytes(mem_used), format_bytes(mem_total)),
-            swap_detail: format!("{}/{}", format_bytes(swap_used), format_bytes(swap_total)),
-            net_rx: format!("{}/s", format_bytes(rx_rate)),
-            net_tx: format!("{}/s", format_bytes(tx_rate)),
+            mem_detail: format_usage(mem_used, mem_total),
+            swap_detail: format_usage(swap_used, swap_total),
+            net_rx: format_rate(rx_rate),
+            net_tx: format_rate(tx_rate),
             net_rx_rate: rx_rate,
             net_tx_rate: tx_rate,
             disks,
@@ -170,6 +162,22 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+fn format_usage(used: u64, total: u64) -> String {
+    format!("{}/{}", format_bytes(used), format_bytes(total))
+}
+
+fn format_rate(bytes: u64) -> String {
+    format!("{}/s", format_bytes(bytes))
+}
+
+fn sort_disks(disks: &mut [DiskSample]) {
+    disks.sort_by(|a, b| {
+        (a.mount != "/")
+            .cmp(&(b.mount != "/"))
+            .then_with(|| a.mount.cmp(&b.mount))
+    });
 }
 
 pub fn remote_snapshot_from_kv(raw: &str) -> Result<SystemSnapshot> {
@@ -224,24 +232,16 @@ pub fn remote_snapshot_from_kv(raw: &str) -> Result<SystemSnapshot> {
     // (catches any virtual fs lines that slipped past the script filter)
     disks.retain(|d| d.total_bytes >= 1024 * 1024);
 
-    disks.sort_by(|a, b| {
-        if a.mount == "/" {
-            return std::cmp::Ordering::Less;
-        }
-        if b.mount == "/" {
-            return std::cmp::Ordering::Greater;
-        }
-        a.mount.cmp(&b.mount)
-    });
+    sort_disks(&mut disks);
 
     Ok(SystemSnapshot {
         cpu_percent: cpu_percent.clamp(0.0, 1.0),
         mem_percent: ratio(mem_used, mem_total),
         swap_percent: ratio(swap_used, swap_total),
-        mem_detail: format!("{}/{}", format_bytes(mem_used), format_bytes(mem_total)),
-        swap_detail: format!("{}/{}", format_bytes(swap_used), format_bytes(swap_total)),
-        net_rx: format!("{}/s", format_bytes(rx_rate)),
-        net_tx: format!("{}/s", format_bytes(tx_rate)),
+        mem_detail: format_usage(mem_used, mem_total),
+        swap_detail: format_usage(swap_used, swap_total),
+        net_rx: format_rate(rx_rate),
+        net_tx: format_rate(tx_rate),
         net_rx_rate: rx_rate,
         net_tx_rate: tx_rate,
         disks,
@@ -378,13 +378,14 @@ mod tests {
     #[test]
     fn clamps_remote_resource_values_to_valid_ranges() {
         let snapshot = remote_snapshot_from_kv(
-            "CPU_PERCENT=250\nMEM_TOTAL=100\nMEM_USED=150\nSWAP_TOTAL=0\nSWAP_USED=10\nNET_RX=12\nNET_TX=34\nDISK=/\t3145728\t2097152\n",
+            "CPU_PERCENT=250\nMEM_TOTAL=100\nMEM_USED=150\nSWAP_TOTAL=0\nSWAP_USED=10\nNET_RX=12\nNET_TX=34\nDISK=/data\t1048576\t2097152\nDISK=/\t3145728\t2097152\n",
         )
         .unwrap();
 
         assert_eq!(snapshot.cpu_percent, 1.0);
         assert_eq!(snapshot.mem_percent, 1.0);
         assert_eq!(snapshot.swap_percent, 0.0);
+        assert_eq!(snapshot.disks[0].mount, "/");
         assert_eq!(snapshot.disks[0].available_bytes, 2097152);
     }
 

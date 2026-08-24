@@ -61,6 +61,20 @@ impl Ashell {
         });
     }
 
+    fn search_tab_index(&self) -> Option<usize> {
+        self.active_tab
+            .as_deref()
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            .or_else(|| {
+                self.active_group
+                    .as_ref()
+                    .and_then(|group_id| self.tab_groups.iter().find(|group| &group.id == group_id))
+                    .and_then(|group| group.pane_root.first_tab_id())
+                    .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            })
+            .or_else(|| (!self.tabs.is_empty()).then_some(0))
+    }
+
     pub(crate) fn perform_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).text().to_string();
         if query.is_empty() {
@@ -72,28 +86,7 @@ impl Ashell {
             return;
         }
 
-        // Find the active tab — try active_tab first, then fall back to the
-        // first tab in the active group, then any tab.
-        let tab = self
-            .active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id));
-
-        let tab = tab.or_else(|| {
-            let first_id = self
-                .active_group
-                .as_ref()
-                .and_then(|gid| self.tab_groups.iter().find(|g| &g.id == gid))
-                .and_then(|g| g.pane_root.tab_ids().into_iter().next())
-                .map(|s| s.to_string());
-            first_id
-                .as_deref()
-                .and_then(|id| self.tabs.iter().find(|t| t.id == id))
-        });
-
-        let tab = tab.or_else(|| self.tabs.first());
-
-        let Some(tab) = tab else {
+        let Some(tab_index) = self.search_tab_index() else {
             self.status = t!("no_results").into();
             self.refocus_search_input(window, cx);
             cx.notify();
@@ -101,7 +94,8 @@ impl Ashell {
         };
 
         // Remember which tab was searched so highlights only appear in that pane.
-        self.search_target_tab = Some(tab.id.clone());
+        self.search_target_tab = Some(self.tabs[tab_index].id.clone());
+        let tab = &self.tabs[tab_index];
 
         let query_lower = query.to_lowercase();
         let query_byte_len = query.len();
@@ -145,6 +139,7 @@ impl Ashell {
             }
         }
 
+        matches.sort_unstable();
         let match_count = count_match_groups(&matches);
 
         self.search_query = query;
@@ -205,7 +200,7 @@ impl Ashell {
             self.active_group
                 .as_ref()
                 .and_then(|gid| self.tab_groups.iter().find(|g| &g.id == gid))
-                .and_then(|g| g.pane_root.tab_ids().into_iter().next())
+                .and_then(|g| g.pane_root.first_tab_id())
                 .map(|s| s.to_string())
         });
 
@@ -253,35 +248,14 @@ impl Ashell {
             return None;
         }
 
-        // Get current display_offset to convert grid line → viewport row.
-        let tab = self
-            .active_tab
-            .as_ref()
-            .and_then(|id| self.tabs.iter().find(|t| &t.id == id));
-
-        let tab = tab.or_else(|| {
-            let first_id = self
-                .active_group
-                .as_ref()
-                .and_then(|gid| self.tab_groups.iter().find(|g| &g.id == gid))
-                .and_then(|g| g.pane_root.tab_ids().into_iter().next())
-                .map(|s| s.to_string());
-            first_id
-                .as_deref()
-                .and_then(|id| self.tabs.iter().find(|t| t.id == id))
-        });
-
-        let tab = tab.or_else(|| self.tabs.first());
-
-        let tab = tab?;
+        let tab = self.tabs.get(self.search_tab_index()?)?;
         let snapshot = tab.render_snapshot(false);
         let display_offset = snapshot.display_offset as i32;
         let rows = snapshot.rows as i32;
 
         let mut map = HashMap::new();
 
-        let mut sorted: Vec<(i32, i32)> = self.search_matches.clone();
-        sorted.sort();
+        let sorted = &self.search_matches;
 
         let mut group_idx = 0;
         let mut i = 0;
@@ -296,27 +270,15 @@ impl Ashell {
             // grid_line → viewport row:  vp_row = grid_line + display_offset
             let (grid_line, _) = sorted[i];
             let vp_row = grid_line + display_offset;
-            let mut j = i;
+            let next_i = next_match_group_index(sorted, i);
             if vp_row >= 0 && vp_row < rows {
-                while j < sorted.len() && sorted[j].0 == grid_line {
-                    if j > i && sorted[j].1 != sorted[j - 1].1 + 1 {
-                        break;
-                    }
-                    map.insert((vp_row, sorted[j].1), color);
-                    j += 1;
-                }
-            } else {
-                // Outside current viewport — skip.
-                while j < sorted.len() && sorted[j].0 == grid_line {
-                    if j > i && sorted[j].1 != sorted[j - 1].1 + 1 {
-                        break;
-                    }
-                    j += 1;
+                for &(_, col) in &sorted[i..next_i] {
+                    map.insert((vp_row, col), color);
                 }
             }
 
             group_idx += 1;
-            i = j;
+            i = next_i;
         }
 
         Some(map)
@@ -442,44 +404,50 @@ impl Ashell {
 /// Count distinct match groups in a sorted list of (row, col) positions.
 /// A group is a run of consecutive columns in the same row.
 fn count_match_groups(matches: &[(i32, i32)]) -> usize {
-    if matches.is_empty() {
-        return 0;
-    }
-    let mut sorted: Vec<(i32, i32)> = matches.to_vec();
-    sorted.sort();
     let mut count = 0;
     let mut i = 0;
-    while i < sorted.len() {
+    while i < matches.len() {
         count += 1;
-        let (r, _) = sorted[i];
-        i += 1;
-        // Skip consecutive columns in the same row.
-        while i < sorted.len() && sorted[i].0 == r && sorted[i].1 == sorted[i - 1].1 + 1 {
-            i += 1;
-        }
+        i = next_match_group_index(matches, i);
     }
     count
 }
 
 /// Find the (row, col) start of the Nth distinct match group.
 fn find_nth_match_start(matches: &[(i32, i32)], n: usize) -> Option<(i32, i32)> {
-    if matches.is_empty() {
-        return None;
-    }
-    let mut sorted: Vec<(i32, i32)> = matches.to_vec();
-    sorted.sort();
     let mut group_idx = 0;
     let mut i = 0;
-    while i < sorted.len() {
+    while i < matches.len() {
         if group_idx == n {
-            return Some(sorted[i]);
+            return Some(matches[i]);
         }
         group_idx += 1;
-        let (r, _) = sorted[i];
-        i += 1;
-        while i < sorted.len() && sorted[i].0 == r && sorted[i].1 == sorted[i - 1].1 + 1 {
-            i += 1;
-        }
+        i = next_match_group_index(matches, i);
     }
     None
+}
+
+fn next_match_group_index(matches: &[(i32, i32)], start: usize) -> usize {
+    let row = matches[start].0;
+    let mut end = start + 1;
+    while end < matches.len() && matches[end].0 == row && matches[end].1 == matches[end - 1].1 + 1 {
+        end += 1;
+    }
+    end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{count_match_groups, find_nth_match_start};
+
+    #[test]
+    fn groups_consecutive_search_matches_by_row() {
+        let matches = [(0, 1), (0, 2), (0, 5), (1, 0), (1, 1)];
+
+        assert_eq!(count_match_groups(&matches), 3);
+        assert_eq!(find_nth_match_start(&matches, 0), Some((0, 1)));
+        assert_eq!(find_nth_match_start(&matches, 1), Some((0, 5)));
+        assert_eq!(find_nth_match_start(&matches, 2), Some((1, 0)));
+        assert_eq!(find_nth_match_start(&matches, 3), None);
+    }
 }

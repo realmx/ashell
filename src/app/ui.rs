@@ -5157,7 +5157,7 @@ impl Ashell {
                         }
                     })
                     .unwrap_or(cx.theme().success);
-                let has_multiple_panes = this.pane_root.tab_ids().len() > 1;
+                let has_multiple_panes = this.pane_root.total_panes() > 1;
 
                 if !is_focused {
                     el = el.opacity(0.85);
@@ -5235,13 +5235,7 @@ impl Ashell {
                                         cx.listener(move |this, event, window, cx| {
                                             window.prevent_default();
                                             cx.stop_propagation();
-                                            this.start_drag_split(
-                                                splitter_path.clone(),
-                                                i,
-                                                event,
-                                                window,
-                                                cx,
-                                            );
+                                            this.start_drag_split(splitter_path.clone(), event);
                                         }),
                                     )
                                     .into_any_element(),
@@ -5285,13 +5279,7 @@ impl Ashell {
                                     cx.listener(move |this, event, window, cx| {
                                         window.prevent_default();
                                         cx.stop_propagation();
-                                        this.start_drag_split(
-                                            splitter_path.clone(),
-                                            i,
-                                            event,
-                                            window,
-                                            cx,
-                                        );
+                                        this.start_drag_split(splitter_path.clone(), event);
                                     }),
                                 )
                                 .into_any_element(),

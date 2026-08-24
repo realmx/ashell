@@ -432,11 +432,7 @@ impl Ashell {
                 self.tabs.retain(|tab| tab.id != tab_id);
                 restored_tab_ids.remove(&tab_id);
             }
-            if pane_root
-                .tab_ids()
-                .first()
-                .is_none_or(|tab_id| tab_id.is_empty())
-            {
+            if pane_root.first_tab_id().is_none_or(str::is_empty) {
                 continue;
             }
 
@@ -470,7 +466,7 @@ impl Ashell {
         self.pane_root = active_layout;
         let active_tab = requested_active_tab
             .filter(|id| self.pane_root.contains(id))
-            .or_else(|| self.pane_root.tab_ids().first().map(|id| (*id).to_string()));
+            .or_else(|| self.pane_root.first_tab_id().map(str::to_string));
         if let Some(active_tab) = active_tab {
             self.focus_pane_with_id(active_tab);
         }
@@ -1917,16 +1913,12 @@ impl Ashell {
                     if pos > 0 {
                         next_active_id = all_groups[pos - 1]
                             .pane_root
-                            .tab_ids()
-                            .first()
-                            .copied()
+                            .first_tab_id()
                             .map(String::from);
                     } else if pos + 1 < all_groups.len() {
                         next_active_id = all_groups[pos + 1]
                             .pane_root
-                            .tab_ids()
-                            .first()
-                            .copied()
+                            .first_tab_id()
                             .map(String::from);
                     }
                 }
@@ -1942,8 +1934,8 @@ impl Ashell {
                 .collect();
             for tab_id in &tab_ids {
                 if let Some(ix) = self.tabs.iter().position(|tab| tab.id == *tab_id) {
-                    self.tabs[ix].send_backend(BackendCommand::Close);
-                    self.tabs.retain(|t| t.id != *tab_id);
+                    let tab = self.tabs.remove(ix);
+                    tab.send_backend(BackendCommand::Close);
                 }
             }
             if let Some(handle) = self.sftp_handles.remove(&group.id) {
@@ -1954,8 +1946,8 @@ impl Ashell {
         } else {
             // Just remove this tab from the group
             if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
-                self.tabs[ix].send_backend(BackendCommand::Close);
-                self.tabs.retain(|t| t.id != id);
+                let tab = self.tabs.remove(ix);
+                tab.send_backend(BackendCommand::Close);
             }
             if let Some(g) = self
                 .tab_groups
@@ -1976,18 +1968,7 @@ impl Ashell {
             self.tab_groups.clear();
             self.tabs.clear();
             self.system_tab_id = None;
-            self.cpu_history.clear();
-            self.net_rx_history.clear();
-            self.net_tx_history.clear();
-            self.remote_processes.clear();
-            self.remote_ports.clear();
-            self.terminating_processes.clear();
-            self.remote_process_status = None;
-            self.remote_ports_status = None;
-            self.remote_processes_in_flight = false;
-            self.remote_ports_in_flight = false;
-            self.expanded_process_pid = None;
-            self.system_status = None;
+            self.reset_system_monitor_state();
             self.show_command_history = false;
             self.selected_command_history.clear();
             for (_, handle) in self.sftp_handles.drain() {
@@ -2008,9 +1989,7 @@ impl Ashell {
             // Activate next available pane
             let new_id = next_active_id.or_else(|| {
                 self.pane_root
-                    .tab_ids()
-                    .first()
-                    .copied()
+                    .first_tab_id()
                     .map(String::from)
                     .or_else(|| self.tabs.first().map(|t| t.id.clone()))
             });
@@ -2462,8 +2441,7 @@ impl Ashell {
         if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
             self.pane_root = group.pane_root.clone();
             self.active_group = Some(group_id);
-            let ids = group.pane_root.tab_ids();
-            if let Some(&first_id) = ids.first() {
+            if let Some(first_id) = group.pane_root.first_tab_id() {
                 self.active_tab = Some(first_id.to_string());
                 self.focus_pane_with_id(first_id.to_string());
             }
@@ -2610,19 +2588,7 @@ impl Ashell {
 
         if self.system_tab_id != new_id {
             self.system_tab_id = new_id;
-            self.system = crate::system::SystemSnapshot::default();
-            self.cpu_history.clear();
-            self.net_rx_history.clear();
-            self.net_tx_history.clear();
-            self.remote_processes.clear();
-            self.remote_ports.clear();
-            self.terminating_processes.clear();
-            self.remote_sample_in_flight = false;
-            self.remote_processes_in_flight = false;
-            self.remote_ports_in_flight = false;
-            self.remote_process_status = None;
-            self.remote_ports_status = None;
-            self.expanded_process_pid = None;
+            self.reset_system_monitor_state();
             if let Some(status) = active_ssh_status {
                 self.system_status = Some(status.clone().into());
                 self.remote_process_status = Some(status.into());
@@ -2639,25 +2605,13 @@ impl Ashell {
         }
     }
 
-    pub(crate) fn start_drag_split(
-        &mut self,
-        parent_path: Vec<usize>,
-        child_index: usize,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        self.dragging_splitter = Some((parent_path, child_index));
+    pub(crate) fn start_drag_split(&mut self, parent_path: Vec<usize>, event: &MouseDownEvent) {
+        self.dragging_splitter = Some(parent_path);
         self.drag_split_origin = Some(event.position);
     }
 
-    pub(crate) fn on_split_drag_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        let Some((ref parent_path, child_idx)) = self.dragging_splitter.clone() else {
+    pub(crate) fn on_split_drag_move(&mut self, event: &MouseMoveEvent, window: &mut Window) {
+        let Some(parent_path) = self.dragging_splitter.as_deref() else {
             return;
         };
         let Some(origin) = self.drag_split_origin else {
@@ -2679,7 +2633,7 @@ impl Ashell {
             return; // dead zone
         }
         let ratio_delta = delta / total_size;
-        Self::adjust_split_ratio(&mut self.pane_root, parent_path, child_idx, ratio_delta);
+        Self::adjust_split_ratio(&mut self.pane_root, parent_path, ratio_delta);
         self.drag_split_origin = Some(event.position);
         self.sync_pane_root_to_group();
     }
@@ -2704,7 +2658,7 @@ impl Ashell {
         }
     }
 
-    fn adjust_split_ratio(layout: &mut PaneLayout, path: &[usize], _child_idx: usize, delta: f32) {
+    fn adjust_split_ratio(layout: &mut PaneLayout, path: &[usize], delta: f32) {
         if let PaneLayout::Horizontal(children, ratio) | PaneLayout::Vertical(children, ratio) =
             layout
         {
@@ -2713,7 +2667,7 @@ impl Ashell {
             } else {
                 let (&first, rest) = path.split_first().unwrap();
                 if let Some(child) = children.get_mut(first) {
-                    Self::adjust_split_ratio(child, rest, _child_idx, delta);
+                    Self::adjust_split_ratio(child, rest, delta);
                 }
             }
         }

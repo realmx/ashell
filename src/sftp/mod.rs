@@ -26,7 +26,6 @@ use tokio::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    task::JoinHandle,
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -107,7 +106,6 @@ pub struct TransferStateFlag(pub Arc<AtomicU8>);
 struct TransferContext<'a> {
     flag: &'a TransferStateFlag,
     events: &'a std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &'a str,
     id: &'a str,
 }
 
@@ -129,7 +127,6 @@ impl TransferStateFlag {
     pub async fn yield_if_paused(
         &self,
         events: &std::sync::mpsc::Sender<crate::terminal::BackendEvent>,
-        tab_id: &str,
         id: &str,
         transferred: u64,
         total: Option<u64>,
@@ -143,7 +140,6 @@ impl TransferStateFlag {
             if state == 1 {
                 if !was_paused {
                     let _ = events.send(crate::terminal::BackendEvent::TransferProgress {
-                        tab_id: tab_id.to_string(),
                         id: id.to_string(),
                         transferred,
                         total,
@@ -155,7 +151,6 @@ impl TransferStateFlag {
             } else {
                 if was_paused {
                     let _ = events.send(crate::terminal::BackendEvent::TransferProgress {
-                        tab_id: tab_id.to_string(),
                         id: id.to_string(),
                         transferred,
                         total,
@@ -168,19 +163,9 @@ impl TransferStateFlag {
     }
 }
 
+#[derive(Clone)]
 pub struct SftpHandle {
     pub commands: UnboundedSender<SftpCommand>,
-    #[allow(dead_code)]
-    join: Option<JoinHandle<()>>,
-}
-
-impl Clone for SftpHandle {
-    fn clone(&self) -> Self {
-        Self {
-            commands: self.commands.clone(),
-            join: None,
-        }
-    }
 }
 
 impl SftpHandle {
@@ -269,7 +254,7 @@ pub fn spawn_sftp(
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let cmd_tx_clone = cmd_tx.clone();
-    let join = runtime.spawn(async move {
+    drop(runtime.spawn(async move {
         if let Err(err) = run_sftp(
             tab_id.clone(),
             session,
@@ -284,11 +269,8 @@ pub fn spawn_sftp(
                 text: format!("sftp error: {err:#}"),
             });
         }
-    });
-    SftpHandle {
-        commands: cmd_tx,
-        join: Some(join),
-    }
+    }));
+    SftpHandle { commands: cmd_tx }
 }
 
 async fn run_sftp(
@@ -411,7 +393,6 @@ async fn run_sftp(
                         let transfer = TransferContext {
                             flag: &flag,
                             events: &events_clone,
-                            tab_id: &tab_id_clone,
                             id: &id,
                         };
                         download_path_impl(
@@ -443,7 +424,7 @@ async fn run_sftp(
                                 crate::terminal::TransferState::Failed(err_msg.clone())
                             };
                             let _ = events_clone.send(BackendEvent::SftpStatus {
-                                tab_id: tab_id_clone.clone(),
+                                tab_id: tab_id_clone,
                                 text: if is_cancelled {
                                     "Transmission cancelled".to_string()
                                 } else {
@@ -451,7 +432,6 @@ async fn run_sftp(
                                 },
                             });
                             let _ = events_clone.send(BackendEvent::TransferProgress {
-                                tab_id: tab_id_clone,
                                 id: id.clone(),
                                 transferred: 0,
                                 total: None,
@@ -524,7 +504,6 @@ async fn run_sftp(
                             &remote_dir,
                             flag,
                             &events_clone,
-                            &tab_id_clone,
                             &id,
                         )
                         .await
@@ -534,7 +513,7 @@ async fn run_sftp(
                     match result {
                         Ok(summary) => {
                             let _ = events_clone.send(BackendEvent::SftpStatus {
-                                tab_id: tab_id_clone.clone(),
+                                tab_id: tab_id_clone,
                                 text: summary,
                             });
                             let _ = commands_tx_clone.send(SftpCommand::ListDir(remote_dir));
@@ -550,7 +529,7 @@ async fn run_sftp(
                                 crate::terminal::TransferState::Failed(err_msg.clone())
                             };
                             let _ = events_clone.send(BackendEvent::SftpStatus {
-                                tab_id: tab_id_clone.clone(),
+                                tab_id: tab_id_clone,
                                 text: if is_cancelled {
                                     "Transmission cancelled".to_string()
                                 } else {
@@ -558,7 +537,6 @@ async fn run_sftp(
                                 },
                             });
                             let _ = events_clone.send(BackendEvent::TransferProgress {
-                                tab_id: tab_id_clone,
                                 id: id.clone(),
                                 transferred: 0,
                                 total: None,
@@ -1467,13 +1445,7 @@ async fn download_file_impl(
     loop {
         transfer
             .flag
-            .yield_if_paused(
-                transfer.events,
-                transfer.tab_id,
-                transfer.id,
-                transferred,
-                total,
-            )
+            .yield_if_paused(transfer.events, transfer.id, transferred, total)
             .await?;
         let read = remote_file
             .read(&mut buffer)
@@ -1489,7 +1461,6 @@ async fn download_file_impl(
 
         transferred += read as u64;
         let _ = transfer.events.send(BackendEvent::TransferProgress {
-            tab_id: transfer.tab_id.to_string(),
             id: transfer.id.to_string(),
             transferred,
             total,
@@ -1499,7 +1470,6 @@ async fn download_file_impl(
     local_file.flush().await.context("flush local file")?;
 
     let _ = transfer.events.send(BackendEvent::TransferProgress {
-        tab_id: transfer.tab_id.to_string(),
         id: transfer.id.to_string(),
         transferred,
         total,
@@ -1515,7 +1485,6 @@ async fn upload_paths_impl(
     remote_dir: &str,
     flag: TransferStateFlag,
     events: &std::sync::mpsc::Sender<BackendEvent>,
-    tab_id: &str,
     id: &str,
 ) -> Result<String> {
     // Check for cancellation before starting
@@ -1598,7 +1567,6 @@ async fn upload_paths_impl(
     for (local_path, remote_path) in files_to_upload {
         let flag_clone = TransferStateFlag(Arc::clone(&flag.0));
         let events_clone = events.clone();
-        let tab_id_clone = tab_id.to_string();
         let id_clone = id.to_string();
         let transferred_clone = Arc::clone(&transferred);
 
@@ -1606,7 +1574,6 @@ async fn upload_paths_impl(
             let transfer = TransferContext {
                 flag: &flag_clone,
                 events: &events_clone,
-                tab_id: &tab_id_clone,
                 id: &id_clone,
             };
             upload_file_impl(
@@ -1628,7 +1595,6 @@ async fn upload_paths_impl(
     }
 
     let _ = events.send(BackendEvent::TransferProgress {
-        tab_id: tab_id.to_string(),
         id: id.to_string(),
         transferred: total_bytes,
         total: Some(total_bytes),
@@ -1675,7 +1641,7 @@ async fn upload_file_impl(
         let cur = transferred.load(Ordering::Relaxed);
         transfer
             .flag
-            .yield_if_paused(transfer.events, transfer.tab_id, transfer.id, cur, total)
+            .yield_if_paused(transfer.events, transfer.id, cur, total)
             .await?;
         let read = local.read(&mut buffer).await.context("read local file")?;
         if read == 0 {
@@ -1688,7 +1654,6 @@ async fn upload_file_impl(
 
         let new_cur = transferred.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
         let _ = transfer.events.send(BackendEvent::TransferProgress {
-            tab_id: transfer.tab_id.to_string(),
             id: transfer.id.to_string(),
             transferred: new_cur,
             total,
