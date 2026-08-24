@@ -38,6 +38,7 @@ pub enum TabKind {
 }
 
 const TERMINAL_ACTIVITY_GRACE: Duration = Duration::from_millis(750);
+const CLICK_CURSOR_PREDICTION_TTL: Duration = Duration::from_millis(750);
 const MAX_OSC_PAYLOAD_BYTES: usize = 4096;
 const MAX_NOTIFICATION_TEXT_BYTES: usize = 8192;
 const MAX_OSC99_IDENTIFIER_BYTES: usize = 128;
@@ -115,7 +116,10 @@ enum OscTerminalState {
 enum OscTerminalEvent {
     Notification(TerminalNotification),
     ProtocolReply(Vec<u8>),
-    PromptStarted { click_mode: Option<PromptClickMode> },
+    PromptStarted {
+        click_mode: Option<PromptClickMode>,
+        secondary: bool,
+    },
     PromptEnded,
     CommandStarted,
     CommandFinished,
@@ -128,11 +132,13 @@ pub(crate) enum PromptClickMode {
     TerminalManaged,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptInputClickState {
     pub(crate) mode: PromptClickMode,
-    pub(crate) prompt_start: (usize, usize),
     pub(crate) command_start: (usize, usize),
+    pub(crate) command_starts: Vec<(usize, usize)>,
+    pub(crate) prompt_row_offset: usize,
+    pub(crate) relative_click_valid: bool,
 }
 
 #[derive(Debug)]
@@ -503,9 +509,18 @@ fn parse_osc777(payload: &str) -> Option<TerminalNotification> {
 fn parse_shell_integration_event(payload: &str) -> Option<OscTerminalEvent> {
     let mut fields = payload.split(';');
     match fields.next()? {
-        "A" => Some(OscTerminalEvent::PromptStarted {
-            click_mode: fields.find_map(parse_prompt_click_mode),
-        }),
+        "A" => {
+            let mut click_mode = None;
+            let mut secondary = false;
+            for field in fields {
+                secondary |= field == "k=s";
+                click_mode = click_mode.or_else(|| parse_prompt_click_mode(field));
+            }
+            Some(OscTerminalEvent::PromptStarted {
+                click_mode,
+                secondary,
+            })
+        }
         "B" => Some(OscTerminalEvent::PromptEnded),
         "C" => Some(OscTerminalEvent::CommandStarted),
         "D" => Some(OscTerminalEvent::CommandFinished),
@@ -518,7 +533,6 @@ fn parse_prompt_click_mode(field: &str) -> Option<PromptClickMode> {
     match (key, value) {
         ("click_events", "1") => Some(PromptClickMode::Absolute),
         ("click_events", "2") => Some(PromptClickMode::Relative),
-        ("cl", "m") => Some(PromptClickMode::TerminalManaged),
         _ => None,
     }
 }
@@ -862,6 +876,7 @@ pub struct TerminalTab {
     pub cols: u16,
     pub rows: u16,
     prompt_input: Option<PromptInputState>,
+    click_cursor_prediction: Option<ClickCursorPrediction>,
     pub backend: std::sync::Arc<std::sync::Mutex<BackendTx>>,
     backend_events: GuardedBackendEventSender,
     should_cleanup_initial_blank_scrollback: bool,
@@ -876,18 +891,37 @@ type HighlightCache = std::cell::RefCell<
     )>,
 >;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorState {
     pub row: usize,
     pub col: usize,
     pub shape: CursorShape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PromptInputState {
+    // Rows are stored relative to the full buffer so they remain stable when
+    // a multiline command scrolls the viewport.
     prompt_start: (usize, usize),
     command_start: Option<(usize, usize)>,
+    secondary_prompt_starts: Vec<(usize, usize)>,
+    secondary_command_starts: Vec<(usize, usize)>,
     click_mode: PromptClickMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClickCursorPrediction {
+    cursor: CursorState,
+    alternate_screen: bool,
+    expires_at: Instant,
+}
+
+pub(crate) fn encode_cursor_key(key: u8, app_cursor_mode: bool) -> [u8; 3] {
+    if app_cursor_mode {
+        [b'\x1b', b'O', key]
+    } else {
+        [b'\x1b', b'[', key]
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -1135,17 +1169,31 @@ mod backend_event_tests {
 
 #[cfg(test)]
 mod terminal_tab_backend_tests {
-    use super::{BackendTx, GuardedBackendEventSender, TerminalTab};
+    use std::time::{Duration, Instant};
+
+    use alacritty_terminal::vte::ansi::CursorShape;
+
+    use super::{
+        BackendEvent, BackendTx, CLICK_CURSOR_PREDICTION_TTL, CursorState,
+        GuardedBackendEventSender, TerminalTab,
+    };
+
+    fn pending_tab() -> (TerminalTab, std::sync::mpsc::Receiver<BackendEvent>) {
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        (
+            TerminalTab::new_local(
+                "tab-1".into(),
+                "Local".into(),
+                BackendTx::Pending,
+                GuardedBackendEventSender::new(events_tx),
+            ),
+            events_rx,
+        )
+    }
 
     #[test]
     fn pending_backend_starts_only_before_a_disconnect_or_backend_swap() {
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let mut tab = TerminalTab::new_local(
-            "tab-1".into(),
-            "Local".into(),
-            BackendTx::Pending,
-            GuardedBackendEventSender::new(events_tx),
-        );
+        let (mut tab, _events_rx) = pending_tab();
 
         assert!(tab.backend_start_pending());
 
@@ -1160,13 +1208,7 @@ mod terminal_tab_backend_tests {
 
     #[test]
     fn clears_blank_scrollback_created_during_local_terminal_startup() {
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let mut tab = TerminalTab::new_local(
-            "tab-1".into(),
-            "Local".into(),
-            BackendTx::Pending,
-            GuardedBackendEventSender::new(events_tx),
-        );
+        let (mut tab, _events_rx) = pending_tab();
         tab.should_cleanup_initial_blank_scrollback = true;
         tab.resize(10, 2);
 
@@ -1178,13 +1220,7 @@ mod terminal_tab_backend_tests {
 
     #[test]
     fn preserves_non_blank_scrollback_created_during_local_terminal_startup() {
-        let (events_tx, _events_rx) = std::sync::mpsc::channel();
-        let mut tab = TerminalTab::new_local(
-            "tab-1".into(),
-            "Local".into(),
-            BackendTx::Pending,
-            GuardedBackendEventSender::new(events_tx),
-        );
+        let (mut tab, _events_rx) = pending_tab();
         tab.should_cleanup_initial_blank_scrollback = true;
         tab.resize(10, 2);
 
@@ -1192,6 +1228,63 @@ mod terminal_tab_backend_tests {
 
         assert!(tab.render_snapshot(false).history_size > 0);
         assert!(!tab.should_cleanup_initial_blank_scrollback);
+    }
+
+    #[test]
+    fn uses_the_predicted_cursor_for_rapid_clicks_while_output_catches_up() {
+        let (mut tab, _events_rx) = pending_tab();
+        let now = Instant::now();
+        let first_target = CursorState {
+            row: 2,
+            col: 8,
+            shape: CursorShape::Block,
+        };
+        tab.note_click_cursor_move_at(first_target, now);
+
+        assert_eq!(
+            tab.cursor_state_for_click_at(now + Duration::from_millis(10)),
+            Some(first_target)
+        );
+
+        let second_target = CursorState {
+            row: 1,
+            col: 3,
+            shape: CursorShape::Block,
+        };
+        tab.note_click_cursor_move_at(second_target, now + Duration::from_millis(10));
+        assert_eq!(
+            tab.cursor_state_for_click_at(now + Duration::from_millis(20)),
+            Some(second_target)
+        );
+
+        tab.feed(b"\x1b[2;4H");
+        assert_eq!(tab.cursor_state(), Some(second_target));
+        assert_eq!(
+            tab.cursor_state_for_click_at(now + Duration::from_millis(30)),
+            Some(second_target)
+        );
+    }
+
+    #[test]
+    fn expires_or_clears_a_click_cursor_prediction_before_other_input() {
+        let (mut tab, _events_rx) = pending_tab();
+        let actual = tab.cursor_state();
+        let now = Instant::now();
+        let predicted = CursorState {
+            row: 2,
+            col: 8,
+            shape: CursorShape::Block,
+        };
+        tab.note_click_cursor_move_at(predicted, now);
+
+        assert_eq!(
+            tab.cursor_state_for_click_at(now + CLICK_CURSOR_PREDICTION_TTL),
+            actual
+        );
+
+        tab.note_click_cursor_move_at(predicted, now);
+        tab.record_terminal_input(b"x");
+        assert_eq!(tab.cursor_state_for_click_at(now), actual);
     }
 }
 
@@ -1428,7 +1521,10 @@ mod osc_terminal_tests {
         assert_eq!(
             parser.advance(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07"),
             vec![
-                OscTerminalEvent::PromptStarted { click_mode: None },
+                OscTerminalEvent::PromptStarted {
+                    click_mode: None,
+                    secondary: false,
+                },
                 OscTerminalEvent::PromptEnded,
                 OscTerminalEvent::CommandStarted,
             ]
@@ -1461,7 +1557,15 @@ mod osc_terminal_tests {
             event,
             OscTerminalEvent::PromptStarted {
                 click_mode: Some(PromptClickMode::Relative),
+                secondary: false,
             }
+        );
+        assert_eq!(
+            parser.advance(b"\x1b]133;A;cl=m\x07"),
+            vec![OscTerminalEvent::PromptStarted {
+                click_mode: None,
+                secondary: false,
+            }]
         );
     }
 
@@ -1478,11 +1582,74 @@ mod osc_terminal_tests {
         tab.feed(b"\x1b]133;A;click_events=2\x07$ \x1b]133;B\x07");
 
         assert_eq!(
-            tab.prompt_input_click_state(),
+            tab.prompt_input_click_state((0, 2)),
             Some(PromptInputClickState {
                 mode: PromptClickMode::Relative,
-                prompt_start: (0, 0),
                 command_start: (0, 2),
+                command_starts: vec![(0, 2)],
+                prompt_row_offset: 0,
+                relative_click_valid: true,
+            })
+        );
+    }
+
+    #[test]
+    fn tracks_command_starts_for_secondary_prompts() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+
+        tab.feed(
+            b"\x1b]133;A;click_events=2\x07$ \x1b]133;B\x07echo\r\n\x1b]133;A;k=s\x07> \x1b]133;B\x07more",
+        );
+
+        assert_eq!(
+            tab.prompt_input_click_state((0, 2)),
+            Some(PromptInputClickState {
+                mode: PromptClickMode::Relative,
+                command_start: (0, 2),
+                command_starts: vec![(0, 2), (1, 2)],
+                prompt_row_offset: 0,
+                relative_click_valid: false,
+            })
+        );
+        assert_eq!(
+            tab.prompt_input_click_state((1, 2)),
+            Some(PromptInputClickState {
+                mode: PromptClickMode::Relative,
+                command_start: (1, 2),
+                command_starts: vec![(0, 2), (1, 2)],
+                prompt_row_offset: 0,
+                relative_click_valid: true,
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_prompt_coordinates_stable_when_multiline_input_scrolls() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+        tab.resize(8, 2);
+
+        tab.feed(b"\x1b]133;A;click_events=2\x07$ \x1b]133;B\x071234567890123456");
+
+        assert_eq!(
+            tab.prompt_input_click_state((0, 0)),
+            Some(PromptInputClickState {
+                mode: PromptClickMode::Relative,
+                command_start: (0, 0),
+                command_starts: vec![(0, 0)],
+                prompt_row_offset: 1,
+                relative_click_valid: true,
             })
         );
     }
@@ -1647,6 +1814,7 @@ impl TerminalTab {
             cols: 100,
             rows: 30,
             prompt_input: None,
+            click_cursor_prediction: None,
             backend: shared_backend,
             backend_events,
             should_cleanup_initial_blank_scrollback: cfg!(windows) && kind == TabKind::Local,
@@ -1671,6 +1839,7 @@ impl TerminalTab {
         self.processor
             .advance(&mut self.term, &decoded[processed_until..]);
         self.cleanup_initial_blank_scrollback();
+        self.reconcile_click_cursor_prediction(Instant::now());
         notifications
     }
 
@@ -1688,32 +1857,62 @@ impl TerminalTab {
             OscTerminalEvent::ProtocolReply(reply) => {
                 self.send_backend(BackendCommand::Input(reply));
             }
-            OscTerminalEvent::PromptStarted { click_mode } => {
+            OscTerminalEvent::PromptStarted {
+                click_mode,
+                secondary,
+            } => {
+                self.clear_click_cursor_prediction();
                 self.shell_integration_available = true;
                 self.command_running = false;
                 self.output_activity_until = None;
-                let prompt_start = self
-                    .cursor_state()
-                    .map(|cursor| (cursor.row, cursor.col))
-                    .unwrap_or((0, 0));
-                self.prompt_input = Some(PromptInputState {
-                    prompt_start,
-                    command_start: None,
-                    click_mode: click_mode.unwrap_or(PromptClickMode::TerminalManaged),
-                });
+                let prompt_start = self.buffer_cursor_position().unwrap_or((0, 0));
+                if secondary {
+                    if let Some(prompt_input) = self.prompt_input.as_mut() {
+                        prompt_input.secondary_prompt_starts.push(prompt_start);
+                        if let Some(click_mode) = click_mode {
+                            prompt_input.click_mode = click_mode;
+                        }
+                    } else {
+                        self.prompt_input = Some(PromptInputState {
+                            prompt_start,
+                            command_start: None,
+                            secondary_prompt_starts: Vec::new(),
+                            secondary_command_starts: Vec::new(),
+                            click_mode: click_mode.unwrap_or(PromptClickMode::TerminalManaged),
+                        });
+                    }
+                } else {
+                    self.prompt_input = Some(PromptInputState {
+                        prompt_start,
+                        command_start: None,
+                        secondary_prompt_starts: Vec::new(),
+                        secondary_command_starts: Vec::new(),
+                        click_mode: click_mode.unwrap_or(PromptClickMode::TerminalManaged),
+                    });
+                }
             }
             OscTerminalEvent::PromptEnded => {
-                let command_start = self.cursor_state().map(|cursor| (cursor.row, cursor.col));
+                let command_start = self.buffer_cursor_position();
                 if let Some(prompt_input) = self.prompt_input.as_mut() {
-                    prompt_input.command_start = command_start;
+                    if prompt_input.secondary_prompt_starts.len()
+                        > prompt_input.secondary_command_starts.len()
+                    {
+                        if let Some(command_start) = command_start {
+                            prompt_input.secondary_command_starts.push(command_start);
+                        }
+                    } else if prompt_input.command_start.is_none() {
+                        prompt_input.command_start = command_start;
+                    }
                 }
             }
             OscTerminalEvent::CommandStarted => {
+                self.clear_click_cursor_prediction();
                 self.shell_integration_available = true;
                 self.command_running = true;
                 self.prompt_input = None;
             }
             OscTerminalEvent::CommandFinished => {
+                self.clear_click_cursor_prediction();
                 self.shell_integration_available = true;
                 self.command_running = false;
                 self.output_activity_until = None;
@@ -1763,13 +1962,13 @@ impl TerminalTab {
     }
 
     pub(crate) fn record_terminal_input(&mut self, bytes: &[u8]) {
+        self.clear_click_cursor_prediction();
         if self.shell_integration_available
             && !self.is_alternate_screen_active()
             && bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
         {
             self.command_running = true;
             self.output_activity_until = None;
-            self.prompt_input = None;
         }
     }
 
@@ -1779,6 +1978,7 @@ impl TerminalTab {
         self.output_activity_until = None;
         self.shell_integration_available = false;
         self.prompt_input = None;
+        self.clear_click_cursor_prediction();
         self.osc_terminal_parser = OscTerminalParser::default();
         changed
     }
@@ -1807,6 +2007,7 @@ impl TerminalTab {
         self.output_activity_until = None;
         self.command_running = false;
         self.prompt_input = None;
+        self.clear_click_cursor_prediction();
         if let Some(session) = self.session.as_mut() {
             session.terminal_encoding = encoding;
         }
@@ -1861,6 +2062,7 @@ impl TerminalTab {
         if self.cols != new_cols || self.rows != new_rows {
             self.cols = new_cols;
             self.rows = new_rows;
+            self.clear_click_cursor_prediction();
             tracing::info!(
                 "[ui] terminal resized to {}x{} (cols x rows)",
                 self.cols,
@@ -1896,6 +2098,53 @@ impl TerminalTab {
         })
     }
 
+    pub(crate) fn cursor_state_for_click(&mut self) -> Option<CursorState> {
+        self.cursor_state_for_click_at(Instant::now())
+    }
+
+    fn cursor_state_for_click_at(&mut self, now: Instant) -> Option<CursorState> {
+        let actual = self.cursor_state();
+        let Some(prediction) = self.click_cursor_prediction else {
+            return actual;
+        };
+        if now >= prediction.expires_at
+            || prediction.alternate_screen != self.is_alternate_screen_active()
+        {
+            self.click_cursor_prediction = None;
+            return actual;
+        }
+        Some(prediction.cursor)
+    }
+
+    pub(crate) fn note_click_cursor_move(&mut self, cursor: CursorState) {
+        self.note_click_cursor_move_at(cursor, Instant::now());
+    }
+
+    fn note_click_cursor_move_at(&mut self, cursor: CursorState, now: Instant) {
+        self.click_cursor_prediction = Some(ClickCursorPrediction {
+            cursor,
+            alternate_screen: self.is_alternate_screen_active(),
+            expires_at: now + CLICK_CURSOR_PREDICTION_TTL,
+        });
+    }
+
+    pub(crate) fn clear_click_cursor_prediction(&mut self) {
+        self.click_cursor_prediction = None;
+    }
+
+    fn reconcile_click_cursor_prediction(&mut self, now: Instant) {
+        let _ = self.cursor_state_for_click_at(now);
+    }
+
+    fn buffer_cursor_position(&self) -> Option<(usize, usize)> {
+        let grid = self.term.grid();
+        let row = usize::try_from(grid.cursor.point.line.0).ok()?;
+        Some((
+            grid.history_size().saturating_add(row),
+            grid.cursor.point.column.0,
+        ))
+    }
+
     pub fn app_cursor_mode(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
@@ -1910,12 +2159,57 @@ impl TerminalTab {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    pub(crate) fn prompt_input_click_state(&self) -> Option<PromptInputClickState> {
-        let prompt = self.prompt_input?;
+    pub(crate) fn prompt_input_click_state(
+        &self,
+        target: (usize, usize),
+    ) -> Option<PromptInputClickState> {
+        let prompt = self.prompt_input.as_ref()?;
+        let history_size = self.term.grid().history_size();
+        let target_buffer = (history_size.saturating_add(target.0), target.1);
+        let cursor_buffer = self.buffer_cursor_position()?;
+        let current_prompt_start = prompt
+            .secondary_prompt_starts
+            .iter()
+            .rev()
+            .find(|start| **start <= cursor_buffer)
+            .copied()
+            .unwrap_or(prompt.prompt_start);
+        let primary_command_start = prompt.command_start?;
+        let mut command_starts =
+            Vec::with_capacity(1usize.saturating_add(prompt.secondary_command_starts.len()));
+        command_starts.push(primary_command_start);
+        command_starts.extend(prompt.secondary_command_starts.iter().copied());
+        let target_command_start = command_starts
+            .iter()
+            .rev()
+            .find(|start| **start <= target_buffer)
+            .copied()
+            .unwrap_or(primary_command_start);
+        let viewport_point = |point: (usize, usize)| {
+            if point.0 < history_size {
+                (0, 0)
+            } else {
+                (
+                    point
+                        .0
+                        .saturating_sub(history_size)
+                        .min(self.rows.saturating_sub(1) as usize),
+                    point.1,
+                )
+            }
+        };
+        let target_command_start = viewport_point(target_command_start);
+        let mut command_starts = command_starts
+            .into_iter()
+            .map(viewport_point)
+            .collect::<Vec<_>>();
+        command_starts.dedup();
         Some(PromptInputClickState {
             mode: prompt.click_mode,
-            prompt_start: prompt.prompt_start,
-            command_start: prompt.command_start?,
+            command_start: target_command_start,
+            command_starts,
+            prompt_row_offset: target_buffer.0.saturating_sub(current_prompt_start.0),
+            relative_click_valid: target_buffer >= current_prompt_start,
         })
     }
 
@@ -2014,23 +2308,27 @@ impl TerminalTab {
 
     pub fn scroll_history(&mut self, delta: i32) {
         if delta != 0 {
+            self.clear_click_cursor_prediction();
             self.term.scroll_display(Scroll::Delta(delta));
         }
     }
 
     pub fn scroll_up_by(&mut self, lines: usize) {
         if lines != 0 {
+            self.clear_click_cursor_prediction();
             self.term.scroll_display(Scroll::Delta(lines as i32));
         }
     }
 
     pub fn scroll_down_by(&mut self, lines: usize) {
         if lines != 0 {
+            self.clear_click_cursor_prediction();
             self.term.scroll_display(Scroll::Delta(-(lines as i32)));
         }
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.clear_click_cursor_prediction();
         self.term.scroll_display(Scroll::Bottom);
     }
 
@@ -2069,6 +2367,7 @@ impl TerminalTab {
     }
 
     pub fn paste_text(&mut self, text: &str) {
+        self.clear_click_cursor_prediction();
         let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
         let paste_text = text
             .replace('\x1b', "")
