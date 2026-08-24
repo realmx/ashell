@@ -183,6 +183,28 @@ pub(crate) fn clear_unread_indicator(window_handle: Option<isize>) {
     set_unread_indicator(false, window_handle);
 }
 
+#[allow(deprecated)]
+/// Clears notifications delivered by the current application from Notification Center.
+pub(crate) fn clear_current_app_delivered_notifications() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::NSUserNotificationCenter;
+
+        // The default center is scoped to this application, so other apps' notifications remain untouched.
+        NSUserNotificationCenter::defaultUserNotificationCenter().removeAllDeliveredNotifications();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows::UI::Notifications::ToastNotificationManager;
+
+        if let Err(error) = ToastNotificationManager::History().and_then(|history| history.Clear())
+        {
+            tracing::warn!("failed to clear Windows notification history: {error}");
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn set_windows_taskbar_badge(window_handle: isize, unread: bool) -> windows::core::Result<()> {
     use windows::{

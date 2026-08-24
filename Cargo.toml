@@ -70,6 +70,7 @@ windows = { version = "0.57", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "UI_Notifications",
 ] }
 winreg = "0.52"
 
@@ -80,7 +81,7 @@ desktop-notify = { package = "notify-rust", version = "=4.11.5", default-feature
 mac-notification-sys = "=0.6.15"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile"] }
-objc2-foundation = { version = "0.3.2", features = ["NSString"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSUserNotification"] }
 
 [package.metadata.deb]
 maintainer = "ashell contributors"

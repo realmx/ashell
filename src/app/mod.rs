@@ -1269,8 +1269,12 @@ impl Ashell {
             return false;
         }
 
+        let became_active = window_active && !self.window_active;
         self.window_active = window_active;
         self.report_active_terminal_focus(window_active);
+        if became_active {
+            crate::desktop_notification::clear_current_app_delivered_notifications();
+        }
         self.clear_visible_terminal_notifications();
         true
     }
