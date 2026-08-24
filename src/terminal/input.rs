@@ -514,6 +514,60 @@ impl Ashell {
         }
     }
 
+    pub(crate) fn move_terminal_cursor_to_click(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((target_row, target_col, _)) = self.terminal_grid_point_and_side(position) else {
+            return false;
+        };
+        let Some(active_id) = self.active_tab.clone() else {
+            return false;
+        };
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
+            return false;
+        };
+        if tab.is_alternate_screen_active() || tab.mouse_tracking_enabled() {
+            return false;
+        }
+        let Some(cursor) = tab.cursor_state() else {
+            return false;
+        };
+        let bytes = if let Some(click_state) = tab.prompt_input_click_state() {
+            if !prompt_click_is_valid((target_row, target_col), click_state.command_start, cursor) {
+                return false;
+            }
+            match click_state.mode {
+                crate::terminal::PromptClickMode::Absolute
+                | crate::terminal::PromptClickMode::Relative => sgr_mouse_click(
+                    (target_row, target_col),
+                    click_state.prompt_start,
+                    click_state.mode,
+                ),
+                crate::terminal::PromptClickMode::TerminalManaged => {
+                    cursor_move_bytes(cursor, (target_row, target_col), tab.app_cursor_mode())
+                }
+            }
+        } else {
+            // Without shell integration, support the common single-line prompt
+            // while avoiding clicks in output rows or a running foreground app.
+            if tab.is_command_active() || target_row != cursor.row {
+                return false;
+            }
+            cursor_move_bytes(cursor, (target_row, target_col), tab.app_cursor_mode())
+        };
+        tab.clear_selection();
+        if !bytes.is_empty() {
+            tab.send_backend(crate::terminal::BackendCommand::Input(bytes));
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+        true
+    }
+
     pub(crate) fn on_terminal_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -654,9 +708,13 @@ impl Ashell {
         let line_height = px(self.terminal_line_height());
         let snapshot = self.active_snapshot()?;
         let max_col = snapshot.cols.saturating_sub(1);
-        let max_row = snapshot.rows.saturating_sub(1);
         let col = ((local_x / cell_width).floor() as usize).min(max_col);
-        let row = ((local_y / line_height).floor() as usize).min(max_row);
+        let row = terminal_grid_row(
+            local_y.as_f32(),
+            bounds.size.height.as_f32(),
+            line_height.as_f32(),
+            snapshot.rows,
+        );
         let cell_offset_x = px(local_x.as_f32() % cell_width.as_f32());
         let side = if cell_offset_x >= (cell_width / 2.) {
             Side::Right
@@ -777,6 +835,72 @@ impl Ashell {
     }
 }
 
+fn terminal_grid_row(
+    local_y: f32,
+    container_height: f32,
+    line_height: f32,
+    row_count: usize,
+) -> usize {
+    let grid_height = (container_height / line_height).floor().max(1.0) * line_height;
+    let y_offset = ((container_height - grid_height) / 2.0).max(0.0);
+    (((local_y - y_offset).max(0.0) / line_height).floor() as usize)
+        .min(row_count.saturating_sub(1))
+}
+
+fn prompt_click_is_valid(
+    target: (usize, usize),
+    command_start: (usize, usize),
+    cursor: crate::terminal::CursorState,
+) -> bool {
+    if target.0 < command_start.0 || target.0 > cursor.row {
+        return false;
+    }
+    target.0 != command_start.0 || target.1 >= command_start.1
+}
+
+fn cursor_move_bytes(
+    cursor: crate::terminal::CursorState,
+    target: (usize, usize),
+    app_cursor_mode: bool,
+) -> Vec<u8> {
+    let vertical_distance = cursor.row.abs_diff(target.0);
+    let horizontal_distance = cursor.col.abs_diff(target.1);
+    let mut bytes = Vec::with_capacity((vertical_distance + horizontal_distance) * 3);
+
+    let vertical_key = if target.0 < cursor.row { b'A' } else { b'B' };
+    for _ in 0..vertical_distance {
+        append_cursor_key(&mut bytes, vertical_key, app_cursor_mode);
+    }
+
+    let horizontal_key = if target.1 < cursor.col { b'D' } else { b'C' };
+    for _ in 0..horizontal_distance {
+        append_cursor_key(&mut bytes, horizontal_key, app_cursor_mode);
+    }
+
+    bytes
+}
+
+fn append_cursor_key(bytes: &mut Vec<u8>, key: u8, app_cursor_mode: bool) {
+    if app_cursor_mode {
+        bytes.extend_from_slice(&[b'\x1b', b'O', key]);
+    } else {
+        bytes.extend_from_slice(&[b'\x1b', b'[', key]);
+    }
+}
+
+fn sgr_mouse_click(
+    target: (usize, usize),
+    prompt_start: (usize, usize),
+    click_mode: crate::terminal::PromptClickMode,
+) -> Vec<u8> {
+    let row = match click_mode {
+        crate::terminal::PromptClickMode::Absolute
+        | crate::terminal::PromptClickMode::TerminalManaged => target.0 + 1,
+        crate::terminal::PromptClickMode::Relative => target.0.saturating_sub(prompt_start.0) + 1,
+    };
+    format!("\x1b[<0;{};{}M", target.1 + 1, row).into_bytes()
+}
+
 fn terminal_command_text(
     snapshot: &crate::terminal::RenderSnapshot,
     start: (usize, usize),
@@ -831,5 +955,65 @@ fn merge_command_text(rendered: Option<&str>, buffered: &str) -> String {
         format!("{rendered}{}", &buffered[overlap..])
     } else {
         rendered.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::vte::ansi::CursorShape;
+
+    use super::{cursor_move_bytes, prompt_click_is_valid, sgr_mouse_click, terminal_grid_row};
+    use crate::terminal::CursorState;
+    use crate::terminal::PromptClickMode;
+
+    #[test]
+    fn accounts_for_vertical_grid_centering_when_mapping_clicks() {
+        assert_eq!(terminal_grid_row(10.25, 41.0, 10.0, 4), 0);
+        assert_eq!(terminal_grid_row(10.75, 41.0, 10.0, 4), 1);
+    }
+
+    #[test]
+    fn limits_cursor_clicks_to_the_current_prompt_input() {
+        let cursor = CursorState {
+            row: 4,
+            col: 2,
+            shape: CursorShape::Block,
+        };
+
+        assert!(!prompt_click_is_valid((2, 8), (3, 5), cursor));
+        assert!(!prompt_click_is_valid((3, 4), (3, 5), cursor));
+        assert!(prompt_click_is_valid((3, 5), (3, 5), cursor));
+        assert!(prompt_click_is_valid((4, 0), (3, 5), cursor));
+        assert!(!prompt_click_is_valid((5, 0), (3, 5), cursor));
+    }
+
+    #[test]
+    fn encodes_cursor_moves_for_both_terminal_cursor_modes() {
+        let cursor = CursorState {
+            row: 2,
+            col: 4,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            cursor_move_bytes(cursor, (1, 2), false),
+            b"\x1b[A\x1b[D\x1b[D".to_vec()
+        );
+        assert_eq!(
+            cursor_move_bytes(cursor, (1, 2), true),
+            b"\x1bOA\x1bOD\x1bOD".to_vec()
+        );
+    }
+
+    #[test]
+    fn encodes_sgr_click_coordinates_for_prompt_modes() {
+        assert_eq!(
+            sgr_mouse_click((4, 7), (2, 3), PromptClickMode::Absolute),
+            b"\x1b[<0;8;5M".to_vec()
+        );
+        assert_eq!(
+            sgr_mouse_click((4, 7), (2, 3), PromptClickMode::Relative),
+            b"\x1b[<0;8;3M".to_vec()
+        );
     }
 }

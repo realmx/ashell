@@ -2070,6 +2070,14 @@ impl Ashell {
                     }
                 }
             }
+            if event.modifiers.alt
+                && !event.modifiers.control
+                && !event.modifiers.shift
+                && !event.modifiers.platform
+                && self.move_terminal_cursor_to_click(event.position, window, cx)
+            {
+                return;
+            }
             if self.config.right_click_copy_paste() {
                 if let Some(text) = self.active_terminal_selection_text() {
                     if !text.is_empty() {

@@ -115,8 +115,24 @@ enum OscTerminalState {
 enum OscTerminalEvent {
     Notification(TerminalNotification),
     ProtocolReply(Vec<u8>),
+    PromptStarted { click_mode: Option<PromptClickMode> },
+    PromptEnded,
     CommandStarted,
     CommandFinished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptClickMode {
+    Absolute,
+    Relative,
+    TerminalManaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptInputClickState {
+    pub(crate) mode: PromptClickMode,
+    pub(crate) prompt_start: (usize, usize),
+    pub(crate) command_start: (usize, usize),
 }
 
 #[derive(Debug)]
@@ -222,10 +238,18 @@ struct OscTerminalParser {
 
 impl OscTerminalParser {
     /// Scans decoded terminal output without consuming it from the terminal emulator.
+    #[cfg(test)]
     fn advance(&mut self, bytes: &[u8]) -> Vec<OscTerminalEvent> {
+        self.advance_with_offsets(bytes)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    fn advance_with_offsets(&mut self, bytes: &[u8]) -> Vec<(usize, OscTerminalEvent)> {
         let mut events = Vec::new();
 
-        for &byte in bytes {
+        for (index, &byte) in bytes.iter().enumerate() {
             match self.state {
                 OscTerminalState::Ground => {
                     if byte == 0x1b {
@@ -261,7 +285,7 @@ impl OscTerminalParser {
                 OscTerminalState::Payload => match byte {
                     0x07 | 0x9c => {
                         if let Some(event) = self.complete_event() {
-                            events.push(event);
+                            events.push((index + 1, event));
                         }
                     }
                     0x1b => self.state = OscTerminalState::PayloadEscape,
@@ -270,7 +294,7 @@ impl OscTerminalParser {
                 OscTerminalState::PayloadEscape => {
                     if byte == b'\\' {
                         if let Some(event) = self.complete_event() {
-                            events.push(event);
+                            events.push((index + 1, event));
                         }
                     } else {
                         self.push_payload_byte(0x1b);
@@ -342,11 +366,7 @@ impl OscTerminalParser {
                 })
             }
             b"99" => self.parse_osc99(trimmed),
-            b"133" | b"633" => match trimmed.split(';').next() {
-                Some("C") => Some(OscTerminalEvent::CommandStarted),
-                Some("A" | "D") => Some(OscTerminalEvent::CommandFinished),
-                _ => None,
-            },
+            b"133" | b"633" => parse_shell_integration_event(trimmed),
             b"777" => parse_osc777(trimmed).map(OscTerminalEvent::Notification),
             _ => None,
         }
@@ -478,6 +498,29 @@ fn parse_osc777(payload: &str) -> Option<TerminalNotification> {
         occasion: TerminalNotificationOccasion::Always,
         source: TerminalNotificationSource::Osc777,
     })
+}
+
+fn parse_shell_integration_event(payload: &str) -> Option<OscTerminalEvent> {
+    let mut fields = payload.split(';');
+    match fields.next()? {
+        "A" => Some(OscTerminalEvent::PromptStarted {
+            click_mode: fields.find_map(parse_prompt_click_mode),
+        }),
+        "B" => Some(OscTerminalEvent::PromptEnded),
+        "C" => Some(OscTerminalEvent::CommandStarted),
+        "D" => Some(OscTerminalEvent::CommandFinished),
+        _ => None,
+    }
+}
+
+fn parse_prompt_click_mode(field: &str) -> Option<PromptClickMode> {
+    let (key, value) = field.split_once('=')?;
+    match (key, value) {
+        ("click_events", "1") => Some(PromptClickMode::Absolute),
+        ("click_events", "2") => Some(PromptClickMode::Relative),
+        ("cl", "m") => Some(PromptClickMode::TerminalManaged),
+        _ => None,
+    }
 }
 
 fn parse_osc99_metadata(metadata: &str) -> Option<Osc99Metadata> {
@@ -818,6 +861,7 @@ pub struct TerminalTab {
     term: Term<TerminalListener>,
     pub cols: u16,
     pub rows: u16,
+    prompt_input: Option<PromptInputState>,
     pub backend: std::sync::Arc<std::sync::Mutex<BackendTx>>,
     backend_events: GuardedBackendEventSender,
     should_cleanup_initial_blank_scrollback: bool,
@@ -837,6 +881,13 @@ pub struct CursorState {
     pub row: usize,
     pub col: usize,
     pub shape: CursorShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptInputState {
+    prompt_start: (usize, usize),
+    command_start: Option<(usize, usize)>,
+    click_mode: PromptClickMode,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1154,8 +1205,8 @@ mod osc_terminal_tests {
     use super::{
         BackendCommand, BackendEvent, BackendTx, GuardedBackendEventSender, MAX_OSC_PAYLOAD_BYTES,
         MAX_PENDING_OSC99_NOTIFICATIONS, OSC99_PENDING_TTL, OscTerminalEvent, OscTerminalParser,
-        TerminalNotification, TerminalNotificationOccasion, TerminalNotificationSource,
-        TerminalTab,
+        PromptClickMode, PromptInputClickState, TerminalNotification, TerminalNotificationOccasion,
+        TerminalNotificationSource, TerminalTab,
     };
 
     fn notification(
@@ -1377,7 +1428,8 @@ mod osc_terminal_tests {
         assert_eq!(
             parser.advance(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07"),
             vec![
-                OscTerminalEvent::CommandFinished,
+                OscTerminalEvent::PromptStarted { click_mode: None },
+                OscTerminalEvent::PromptEnded,
                 OscTerminalEvent::CommandStarted,
             ]
         );
@@ -1391,6 +1443,47 @@ mod osc_terminal_tests {
                 OscTerminalEvent::CommandStarted,
                 OscTerminalEvent::CommandFinished,
             ]
+        );
+    }
+
+    #[test]
+    fn parses_prompt_click_modes_and_preserves_event_offsets() {
+        let mut parser = OscTerminalParser::default();
+        let bytes = b"prefix\x1b]133;A;click_events=2\x07suffix";
+
+        let (event_end, event) = parser
+            .advance_with_offsets(bytes)
+            .into_iter()
+            .next()
+            .expect("prompt marker event");
+        assert_eq!(event_end, b"prefix\x1b]133;A;click_events=2\x07".len());
+        assert_eq!(
+            event,
+            OscTerminalEvent::PromptStarted {
+                click_mode: Some(PromptClickMode::Relative),
+            }
+        );
+    }
+
+    #[test]
+    fn tracks_prompt_input_start_after_prompt_end_marker() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+
+        tab.feed(b"\x1b]133;A;click_events=2\x07$ \x1b]133;B\x07");
+
+        assert_eq!(
+            tab.prompt_input_click_state(),
+            Some(PromptInputClickState {
+                mode: PromptClickMode::Relative,
+                prompt_start: (0, 0),
+                command_start: (0, 2),
+            })
         );
     }
 
@@ -1553,6 +1646,7 @@ impl TerminalTab {
             term: new_term(100, 30, shared_backend.clone(), id, events.clone()),
             cols: 100,
             rows: 30,
+            prompt_input: None,
             backend: shared_backend,
             backend_events,
             should_cleanup_initial_blank_scrollback: cfg!(windows) && kind == TabKind::Local,
@@ -1567,30 +1661,65 @@ impl TerminalTab {
             self.output_activity_until = Some(Instant::now() + TERMINAL_ACTIVITY_GRACE);
         }
         let mut notifications = Vec::new();
-        for event in self.osc_terminal_parser.advance(&decoded) {
-            match event {
-                OscTerminalEvent::Notification(notification) => {
-                    self.command_running = false;
-                    self.output_activity_until = None;
-                    notifications.push(notification);
-                }
-                OscTerminalEvent::ProtocolReply(reply) => {
-                    self.send_backend(BackendCommand::Input(reply));
-                }
-                OscTerminalEvent::CommandStarted => {
-                    self.shell_integration_available = true;
-                    self.command_running = true;
-                }
-                OscTerminalEvent::CommandFinished => {
-                    self.shell_integration_available = true;
-                    self.command_running = false;
-                    self.output_activity_until = None;
-                }
-            }
+        let mut processed_until = 0;
+        for (event_end, event) in self.osc_terminal_parser.advance_with_offsets(&decoded) {
+            self.processor
+                .advance(&mut self.term, &decoded[processed_until..event_end]);
+            self.handle_osc_terminal_event(event, &mut notifications);
+            processed_until = event_end;
         }
-        self.processor.advance(&mut self.term, &decoded);
+        self.processor
+            .advance(&mut self.term, &decoded[processed_until..]);
         self.cleanup_initial_blank_scrollback();
         notifications
+    }
+
+    fn handle_osc_terminal_event(
+        &mut self,
+        event: OscTerminalEvent,
+        notifications: &mut Vec<TerminalNotification>,
+    ) {
+        match event {
+            OscTerminalEvent::Notification(notification) => {
+                self.command_running = false;
+                self.output_activity_until = None;
+                notifications.push(notification);
+            }
+            OscTerminalEvent::ProtocolReply(reply) => {
+                self.send_backend(BackendCommand::Input(reply));
+            }
+            OscTerminalEvent::PromptStarted { click_mode } => {
+                self.shell_integration_available = true;
+                self.command_running = false;
+                self.output_activity_until = None;
+                let prompt_start = self
+                    .cursor_state()
+                    .map(|cursor| (cursor.row, cursor.col))
+                    .unwrap_or((0, 0));
+                self.prompt_input = Some(PromptInputState {
+                    prompt_start,
+                    command_start: None,
+                    click_mode: click_mode.unwrap_or(PromptClickMode::TerminalManaged),
+                });
+            }
+            OscTerminalEvent::PromptEnded => {
+                let command_start = self.cursor_state().map(|cursor| (cursor.row, cursor.col));
+                if let Some(prompt_input) = self.prompt_input.as_mut() {
+                    prompt_input.command_start = command_start;
+                }
+            }
+            OscTerminalEvent::CommandStarted => {
+                self.shell_integration_available = true;
+                self.command_running = true;
+                self.prompt_input = None;
+            }
+            OscTerminalEvent::CommandFinished => {
+                self.shell_integration_available = true;
+                self.command_running = false;
+                self.output_activity_until = None;
+                self.prompt_input = None;
+            }
+        }
     }
 
     /// Drops ConPTY startup artifacts without removing real terminal output.
@@ -1640,6 +1769,7 @@ impl TerminalTab {
         {
             self.command_running = true;
             self.output_activity_until = None;
+            self.prompt_input = None;
         }
     }
 
@@ -1648,6 +1778,7 @@ impl TerminalTab {
         self.command_running = false;
         self.output_activity_until = None;
         self.shell_integration_available = false;
+        self.prompt_input = None;
         self.osc_terminal_parser = OscTerminalParser::default();
         changed
     }
@@ -1675,6 +1806,7 @@ impl TerminalTab {
         self.osc_terminal_parser = OscTerminalParser::default();
         self.output_activity_until = None;
         self.command_running = false;
+        self.prompt_input = None;
         if let Some(session) = self.session.as_mut() {
             session.terminal_encoding = encoding;
         }
@@ -1768,8 +1900,23 @@ impl TerminalTab {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    pub(crate) fn mouse_tracking_enabled(&self) -> bool {
+        self.term.mode().intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG,
+        )
+    }
+
     pub fn is_alternate_screen_active(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    pub(crate) fn prompt_input_click_state(&self) -> Option<PromptInputClickState> {
+        let prompt = self.prompt_input?;
+        Some(PromptInputClickState {
+            mode: prompt.click_mode,
+            prompt_start: prompt.prompt_start,
+            command_start: prompt.command_start?,
+        })
     }
 
     pub fn render_snapshot(&self, keyword_highlight: bool) -> RenderSnapshot {
