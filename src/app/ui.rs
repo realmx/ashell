@@ -3851,7 +3851,7 @@ impl Ashell {
                                 pointer_button("new-connection-group")
                                     .ghost()
                                     .icon(IconName::Plus)
-                                    .label(t!("new_connection_short").to_string())
+                                    .label(t!("connection_group").to_string())
                                     .tooltip(t!("new_connection_group").to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.show_connection_group_dialog(None, window, cx);
