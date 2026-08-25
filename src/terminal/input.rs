@@ -353,6 +353,7 @@ impl Ashell {
         if is_alternate_screen_active {
             self.ssh_command_buffers.remove(tab_id);
             self.ssh_command_starts.remove(tab_id);
+            self.ssh_command_input_uncertain.remove(tab_id);
             return;
         }
 
@@ -360,6 +361,7 @@ impl Ashell {
         let edits_command = bytes
             .iter()
             .any(|byte| !matches!(*byte, b'\r' | b'\n' | b'\x03'));
+        let mut input_uncertain = self.ssh_command_input_uncertain.contains(tab_id);
         if edits_command && !self.ssh_command_starts.contains_key(tab_id) {
             if let Some(cursor) = cursor {
                 self.ssh_command_starts.insert(tab_id.to_string(), cursor);
@@ -375,7 +377,7 @@ impl Ashell {
                         .iter()
                         .find(|tab| tab.id == tab_id)
                         .map(|tab| tab.render_snapshot(false))
-                        .and_then(|snapshot| terminal_command_text(&snapshot, start))
+                        .and_then(|snapshot| terminal_command_text(&snapshot, start, cursor))
                 })
         } else {
             None
@@ -407,15 +409,22 @@ impl Ashell {
                     continue;
                 }
                 match character {
-                    '\x1b' => in_escape = true,
+                    '\x1b' => {
+                        input_uncertain = true;
+                        in_escape = true;
+                    }
                     '\r' | '\n' => {
-                        let command =
-                            merge_command_text(rendered_command.take().as_deref(), buffer);
+                        let command = command_history_text(
+                            rendered_command.take().as_deref(),
+                            buffer,
+                            input_uncertain,
+                        );
                         if !command.is_empty() {
                             completed.push(command);
                         }
                         buffer.clear();
                         reset_command_start = true;
+                        input_uncertain = false;
                     }
                     '\u{8}' | '\u{7f}' => {
                         buffer.pop();
@@ -424,6 +433,7 @@ impl Ashell {
                     '\u{3}' => {
                         buffer.clear();
                         reset_command_start = true;
+                        input_uncertain = false;
                     }
                     '\u{17}' => {
                         let trimmed_len = buffer.trim_end().len();
@@ -436,12 +446,17 @@ impl Ashell {
                         }
                     }
                     character if !character.is_control() => buffer.push(character),
-                    _ => {}
+                    _ => input_uncertain = true,
                 }
             }
         }
         if reset_command_start {
             self.ssh_command_starts.remove(tab_id);
+            self.ssh_command_input_uncertain.remove(tab_id);
+        } else if input_uncertain {
+            self.ssh_command_input_uncertain.insert(tab_id.to_string());
+        } else {
+            self.ssh_command_input_uncertain.remove(tab_id);
         }
 
         let mut changed = false;
@@ -1267,6 +1282,7 @@ fn append_mouse_coordinate(bytes: &mut Vec<u8>, position: usize, utf8: bool) {
 fn terminal_command_text(
     snapshot: &crate::terminal::RenderSnapshot,
     start: (usize, usize),
+    end: Option<(usize, usize)>,
 ) -> Option<String> {
     let logical_lines =
         crate::terminal::highlight::build_logical_lines(&snapshot.cells, snapshot.rows);
@@ -1279,9 +1295,17 @@ fn terminal_command_text(
             .byte_to_cell
             .iter()
             .position(|(row, col)| *row > start.0 || (*row == start.0 && *col >= start.1))?;
+        let end_byte = end
+            .filter(|(row, col)| *row > start.0 || (*row == start.0 && *col >= start.1))
+            .and_then(|(row, col)| {
+                line.byte_to_cell.iter().position(|(line_row, line_col)| {
+                    *line_row > row || (*line_row == row && *line_col >= col)
+                })
+            })
+            .unwrap_or(line.text.len());
         let command = line
             .text
-            .get(start_byte..)?
+            .get(start_byte..end_byte)?
             .trim_end_matches(|character: char| character == '\0' || character.is_whitespace())
             .replace('\0', "");
         if !command.trim().is_empty() {
@@ -1289,6 +1313,14 @@ fn terminal_command_text(
         }
     }
     None
+}
+
+fn command_history_text(rendered: Option<&str>, buffered: &str, input_uncertain: bool) -> String {
+    let buffered = buffered.trim();
+    if !input_uncertain && !buffered.is_empty() {
+        return buffered.to_string();
+    }
+    merge_command_text(rendered, buffered)
 }
 
 fn merge_command_text(rendered: Option<&str>, buffered: &str) -> String {
@@ -1330,8 +1362,9 @@ mod tests {
     use alacritty_terminal::vte::ansi::CursorShape;
 
     use super::{
-        alternate_screen_cursor_move, prompt_click_is_valid, prompt_cursor_move, sgr_prompt_click,
-        terminal_grid_row, terminal_mouse_click,
+        alternate_screen_cursor_move, command_history_text, prompt_click_is_valid,
+        prompt_cursor_move, sgr_prompt_click, terminal_command_text, terminal_grid_row,
+        terminal_mouse_click,
     };
     use crate::terminal::{CursorState, PromptClickMode, RenderCell, RenderSnapshot};
 
@@ -1534,6 +1567,29 @@ mod tests {
         assert_eq!(
             terminal_mouse_click((2, 3), TermMode::NONE),
             vec![0x1b, b'[', b'M', 32, 36, 35, 0x1b, b'[', b'M', 35, 36, 35]
+        );
+    }
+
+    #[test]
+    fn prefers_direct_input_over_stale_rendered_command_suffix() {
+        let command = "sh /site/vocano/vocano-restart.sh";
+        let rendered = format!("{command} /sivovo-re");
+
+        assert_eq!(
+            command_history_text(Some(rendered.as_str()), command, false),
+            command
+        );
+    }
+
+    #[test]
+    fn truncates_rendered_command_at_the_submission_cursor() {
+        let command = "sh /site/vocano/vocano-restart.sh";
+        let rendered = format!("$ {command} /sivovo-re");
+        let snapshot = snapshot(&[rendered.as_str()], rendered.len());
+
+        assert_eq!(
+            terminal_command_text(&snapshot, (0, 2), Some((0, 2 + command.len())),),
+            Some(command.to_string())
         );
     }
 }
