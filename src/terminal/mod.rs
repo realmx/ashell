@@ -887,7 +887,7 @@ pub struct TerminalTab {
 type HighlightCache = std::cell::RefCell<
     Option<(
         Vec<RenderCell>,
-        std::collections::HashMap<(i32, i32), gpui::Hsla>,
+        std::collections::HashMap<(i32, i32), self::highlight::HighlightStyle>,
     )>,
 >;
 
@@ -940,7 +940,7 @@ pub struct RenderSnapshot {
     pub history_size: usize,
     pub rows: usize,
     pub cols: usize,
-    pub highlights: std::collections::HashMap<(i32, i32), gpui::Hsla>,
+    pub highlights: std::collections::HashMap<(i32, i32), self::highlight::HighlightStyle>,
 }
 
 #[derive(Clone, Copy)]
@@ -2136,7 +2136,7 @@ impl TerminalTab {
         let _ = self.cursor_state_for_click_at(now);
     }
 
-    fn buffer_cursor_position(&self) -> Option<(usize, usize)> {
+    pub(crate) fn buffer_cursor_position(&self) -> Option<(usize, usize)> {
         let grid = self.term.grid();
         let row = usize::try_from(grid.cursor.point.line.0).ok()?;
         Some((

@@ -1,41 +1,19 @@
 use crate::terminal::RenderCell;
-use gpui::Hsla;
+use gpui::{Hsla, Rgba};
 use std::collections::HashMap;
 
-trait HslaExt {
-    fn into_rgba_like(self, r: u8, g: u8, b: u8) -> Self;
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HighlightStyle {
+    pub foreground: Option<Hsla>,
+    pub background: Option<Hsla>,
 }
 
-impl HslaExt for Hsla {
-    fn into_rgba_like(self, r: u8, g: u8, b: u8) -> Self {
-        let rf = r as f32 / 255.0;
-        let gf = g as f32 / 255.0;
-        let bf = b as f32 / 255.0;
-        let max = rf.max(gf).max(bf);
-        let min = rf.min(gf).min(bf);
-        let l = (max + min) / 2.0;
-        if max == min {
-            return Hsla {
-                h: 0.0,
-                s: 0.0,
-                l,
-                a: 1.0,
-            };
+impl HighlightStyle {
+    fn from_foreground(color: Hsla) -> Self {
+        Self {
+            foreground: Some(color),
+            background: None,
         }
-        let d = max - min;
-        let s = if l > 0.5 {
-            d / (2.0 - max - min)
-        } else {
-            d / (max + min)
-        };
-        let h = if max == rf {
-            ((gf - bf) / d + if gf < bf { 6.0 } else { 0.0 }) / 6.0
-        } else if max == gf {
-            ((bf - rf) / d + 2.0) / 6.0
-        } else {
-            ((rf - gf) / d + 4.0) / 6.0
-        };
-        Hsla { h, s, l, a: 1.0 }
     }
 }
 
@@ -97,13 +75,12 @@ struct HighlightColors {
 }
 
 fn hsla(r: u8, g: u8, b: u8) -> Hsla {
-    Hsla {
-        h: 0.0,
-        s: 0.0,
-        l: 0.0,
+    Hsla::from(Rgba {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
         a: 1.0,
-    }
-    .into_rgba_like(r, g, b)
+    })
 }
 
 fn highlight_colors() -> HighlightColors {
@@ -168,7 +145,7 @@ fn highlight_colors() -> HighlightColors {
 struct KeywordMatch {
     start_col: i32,
     end_col: i32,
-    color: Hsla,
+    style: HighlightStyle,
     priority: usize,
 }
 
@@ -184,7 +161,7 @@ impl KeywordMatch {
 
 #[derive(Default)]
 struct KeywordHighlights {
-    colors: HashMap<(i32, i32), Hsla>,
+    styles: HashMap<(i32, i32), HighlightStyle>,
     pending: Vec<KeywordMatch>,
     next_priority: usize,
 }
@@ -214,7 +191,7 @@ impl KeywordHighlights {
 
         for candidate in selected {
             for col in candidate.start_col..=candidate.end_col {
-                self.colors.insert((row_i32, col), candidate.color);
+                self.styles.insert((row_i32, col), candidate.style);
             }
         }
     }
@@ -262,7 +239,7 @@ fn highlight_keywords(
                 map.pending.push(KeywordMatch {
                     start_col,
                     end_col,
-                    color,
+                    style: HighlightStyle::from_foreground(color),
                     priority,
                 });
                 start = abs + kw.len();
@@ -276,7 +253,7 @@ fn highlight_keywords(
 /// Highlight HTTP status codes (200, 301, 404, 500, etc.)
 /// Only matches specific common HTTP codes, not all 3-digit numbers.
 fn highlight_http_codes(
-    map: &mut HashMap<(i32, i32), Hsla>,
+    map: &mut HashMap<(i32, i32), HighlightStyle>,
     text: &str,
     byte_to_col: &[i32],
     row_i32: i32,
@@ -352,12 +329,13 @@ fn highlight_http_codes(
         let start_col = byte_to_col[i];
         let end_col = byte_to_col[(i + 2).min(byte_to_col.len() - 1)];
         for c in start_col..=end_col {
-            map.entry((row_i32, c)).or_insert(color);
+            map.entry((row_i32, c))
+                .or_insert_with(|| HighlightStyle::from_foreground(color));
         }
     }
 }
 
-pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32), Hsla> {
+pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32), HighlightStyle> {
     let colors = highlight_colors();
 
     let mut row_chars: Vec<Vec<(i32, char)>> = vec![Vec::with_capacity(128); rows];
@@ -365,7 +343,9 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
         if rc.row < 0 || (rc.row as usize) >= rows {
             continue;
         }
-        row_chars[rc.row as usize].push((rc.col, rc.cell.c));
+        if let Some(character) = rendered_text_character(&rc.cell) {
+            row_chars[rc.row as usize].push((rc.col, character));
+        }
     }
     for row in row_chars.iter_mut() {
         row.sort_by_key(|&(col, _)| col);
@@ -852,7 +832,7 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
         map.apply_row(row_i32);
 
         // ── 30. HTTP status codes ──────────────────────────────
-        highlight_http_codes(&mut map.colors, text, &byte_to_col, row_i32, &colors);
+        highlight_http_codes(&mut map.styles, text, &byte_to_col, row_i32, &colors);
 
         // ── 31. IP addresses ───────────────────────────────────
         for m in find_ip_addresses(text) {
@@ -860,7 +840,9 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
             let start_col = byte_to_col[m];
             let end_col = byte_to_col[(m + ip_len - 1).min(byte_to_col.len() - 1)];
             for c in start_col..=end_col {
-                map.colors.entry((row_i32, c)).or_insert(colors.network);
+                map.styles
+                    .entry((row_i32, c))
+                    .or_insert_with(|| HighlightStyle::from_foreground(colors.network));
             }
         }
 
@@ -870,7 +852,9 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
             let start_col = byte_to_col[m];
             let end_col = byte_to_col[(m + port_len - 1).min(byte_to_col.len() - 1)];
             for c in start_col..=end_col {
-                map.colors.entry((row_i32, c)).or_insert(colors.port);
+                map.styles
+                    .entry((row_i32, c))
+                    .or_insert_with(|| HighlightStyle::from_foreground(colors.port));
             }
         }
     }
@@ -884,13 +868,15 @@ pub fn highlight_cells(cells: &[RenderCell], rows: usize) -> HashMap<(i32, i32),
                 let idx = m + i;
                 if idx < line.byte_to_cell.len() {
                     let (r, c) = line.byte_to_cell[idx];
-                    map.colors.entry((r as i32, c as i32)).or_insert(colors.url);
+                    map.styles
+                        .entry((r as i32, c as i32))
+                        .or_insert_with(|| HighlightStyle::from_foreground(colors.url));
                 }
             }
         }
     }
 
-    map.colors
+    map.styles
 }
 
 fn find_ip_len(text: &str) -> usize {
@@ -1090,10 +1076,12 @@ pub fn build_logical_lines<'a>(cells: &'a [RenderCell], rows: usize) -> Vec<Logi
         });
 
         for rc in row_cells {
-            line.text.push(rc.cell.c);
-            let end_len = line.text.len();
-            while line.byte_to_cell.len() < end_len {
-                line.byte_to_cell.push((rc.row as usize, rc.col as usize));
+            if let Some(character) = rendered_text_character(&rc.cell) {
+                line.text.push(character);
+                let end_len = line.text.len();
+                while line.byte_to_cell.len() < end_len {
+                    line.byte_to_cell.push((rc.row as usize, rc.col as usize));
+                }
             }
             line.row_cells.push(rc);
         }
@@ -1106,6 +1094,21 @@ pub fn build_logical_lines<'a>(cells: &'a [RenderCell], rows: usize) -> Vec<Logi
     }
 
     logical_lines
+}
+
+fn rendered_text_character(cell: &alacritty_terminal::term::cell::Cell) -> Option<char> {
+    use alacritty_terminal::term::cell::Flags;
+
+    if cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        None
+    } else if cell.flags.contains(Flags::HIDDEN) {
+        Some(' ')
+    } else {
+        Some(cell.c)
+    }
 }
 
 pub fn find_url_at_cell(
@@ -1142,7 +1145,7 @@ pub fn find_url_at_cell(
 
 #[cfg(test)]
 mod tests {
-    use super::{KeywordHighlights, KeywordMatch, find_url_len, hsla};
+    use super::{HighlightStyle, KeywordHighlights, KeywordMatch, find_url_len, hsla};
 
     fn detected_url(text: &str) -> &str {
         &text[..find_url_len(text)]
@@ -1181,21 +1184,26 @@ mod tests {
             KeywordMatch {
                 start_col: 3,
                 end_col: 11,
-                color: short_color,
+                style: HighlightStyle::from_foreground(short_color),
                 priority: 0,
             },
             KeywordMatch {
                 start_col: 0,
                 end_col: 11,
-                color: long_color,
+                style: HighlightStyle::from_foreground(long_color),
                 priority: 1,
             },
         ];
 
         highlights.apply_row(0);
 
-        assert_eq!(highlights.colors.len(), 12);
-        assert!(highlights.colors.values().all(|color| *color == long_color));
+        assert_eq!(highlights.styles.len(), 12);
+        assert!(
+            highlights
+                .styles
+                .values()
+                .all(|style| style.foreground == Some(long_color) && style.background.is_none())
+        );
     }
 
     #[test]
@@ -1208,8 +1216,13 @@ mod tests {
         super::highlight_keywords(&mut highlights, text, &byte_to_col, 0, &["BOOT"], color);
         highlights.apply_row(0);
 
-        assert_eq!(highlights.colors.len(), 4);
-        assert!((0..9).all(|col| !highlights.colors.contains_key(&(0, col))));
-        assert!((10..14).all(|col| highlights.colors.get(&(0, col)) == Some(&color)));
+        assert_eq!(highlights.styles.len(), 4);
+        assert!((0..9).all(|col| !highlights.styles.contains_key(&(0, col))));
+        assert!((10..14).all(|col| {
+            highlights
+                .styles
+                .get(&(0, col))
+                .is_some_and(|style| style.foreground == Some(color) && style.background.is_none())
+        }));
     }
 }

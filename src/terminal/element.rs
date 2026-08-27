@@ -12,6 +12,7 @@ use gpui_component::ActiveTheme as _;
 
 use crate::Ashell;
 use crate::terminal::custom_blocks::{is_custom_block_supported, paint_custom_block};
+use crate::terminal::highlight::HighlightStyle;
 use crate::terminal::{RenderSnapshot, ViewportSelection};
 
 #[derive(Clone, Copy)]
@@ -338,21 +339,16 @@ impl TerminalElement {
         }
     }
 
-    fn cell_run_style(&self, cell: &alacritty_terminal::term::cell::Cell, cx: &App) -> TextRun {
-        let mut fg = color_to_hsla(cell.fg, true, cx);
-        let mut bg = color_to_hsla(cell.bg, false, cx);
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if cell.flags.contains(Flags::DIM) {
-            fg.a *= 0.7;
-        }
-
+    fn cell_run_style(
+        &self,
+        cell: &alacritty_terminal::term::cell::Cell,
+        foreground: Hsla,
+    ) -> TextRun {
         let underline = cell
             .flags
             .intersects(Flags::ALL_UNDERLINES)
             .then(|| UnderlineStyle {
-                color: Some(fg),
+                color: Some(foreground),
                 thickness: px(1.0),
                 wavy: cell.flags.contains(Flags::UNDERCURL),
             });
@@ -360,7 +356,7 @@ impl TerminalElement {
             .flags
             .contains(Flags::STRIKEOUT)
             .then(|| StrikethroughStyle {
-                color: Some(fg),
+                color: Some(foreground),
                 thickness: px(1.0),
             });
 
@@ -377,7 +373,7 @@ impl TerminalElement {
 
         TextRun {
             len: cell.c.len_utf8(),
-            color: fg,
+            color: foreground,
             background_color: None,
             font: Font {
                 family: self.font_family.clone(),
@@ -408,12 +404,6 @@ impl TerminalElement {
         let mut underlines = Vec::new();
         let mut current_run: Option<BatchedTextRun> = None;
 
-        // Retrieve cached keyword highlights and merge with search highlights
-        let mut highlights = self.snapshot.highlights.clone();
-        if let Some(sm) = self.search_highlights.as_ref() {
-            highlights.extend(sm.iter().map(|(k, v)| (*k, *v)));
-        }
-
         for render_cell in &self.snapshot.cells {
             let cell = &render_cell.cell;
             if cell.flags.intersects(
@@ -425,24 +415,54 @@ impl TerminalElement {
             let selected = self.snapshot.selection.is_some_and(|selection| {
                 selection_contains(selection, render_cell.row, render_cell.col)
             });
-            let bg = color_to_hsla(cell.bg, false, cx);
-            if selected || !is_default_bg(cell.bg) || cell.flags.contains(Flags::INVERSE) {
+            let cell_position = (render_cell.row, render_cell.col);
+            let keyword_highlight = self.snapshot.highlights.get(&cell_position).copied();
+            let search_highlight = self
+                .search_highlights
+                .as_ref()
+                .and_then(|highlights| highlights.get(&cell_position))
+                .copied();
+            let (foreground, background) = resolve_cell_colors(
+                color_to_hsla(cell.fg, true, cx),
+                color_to_hsla(cell.bg, false, cx),
+                keyword_highlight,
+                cell.flags,
+            );
+            let cell_span = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+
+            if selected {
                 rects.push(LayoutRect {
                     row: render_cell.row,
                     col: render_cell.col,
-                    cells: if cell.flags.contains(Flags::WIDE_CHAR) {
-                        2
-                    } else {
-                        1
-                    },
-                    color: if selected {
-                        cx.theme().selection
-                    } else if cell.flags.contains(Flags::INVERSE) {
-                        color_to_hsla(cell.fg, true, cx)
-                    } else {
-                        bg
-                    },
+                    cells: cell_span,
+                    color: cx.theme().selection,
                 });
+            } else {
+                let has_highlight_background =
+                    keyword_highlight.is_some_and(|style| style.background.is_some());
+                if !is_default_bg(cell.bg)
+                    || cell.flags.contains(Flags::INVERSE)
+                    || has_highlight_background
+                {
+                    rects.push(LayoutRect {
+                        row: render_cell.row,
+                        col: render_cell.col,
+                        cells: cell_span,
+                        color: background,
+                    });
+                }
+                if let Some(search_background) = search_highlight {
+                    rects.push(LayoutRect {
+                        row: render_cell.row,
+                        col: render_cell.col,
+                        cells: cell_span,
+                        color: search_background,
+                    });
+                }
             }
 
             if is_blank(cell) {
@@ -452,12 +472,7 @@ impl TerminalElement {
                 continue;
             }
 
-            let mut style = self.cell_run_style(cell, cx);
-
-            // Apply keyword highlight color if this cell was matched.
-            if let Some(&hl_color) = highlights.get(&(render_cell.row, render_cell.col)) {
-                style.color = hl_color;
-            }
+            let style = self.cell_run_style(cell, foreground);
 
             // Apply hover underline if mouse is hovering over this URL
             if let Some(hu) = &hovered_url {
@@ -871,6 +886,31 @@ fn selection_contains(selection: ViewportSelection, row: i32, col: i32) -> bool 
     after_start && before_end
 }
 
+fn resolve_cell_colors(
+    mut foreground: Hsla,
+    mut background: Hsla,
+    highlight: Option<HighlightStyle>,
+    flags: Flags,
+) -> (Hsla, Hsla) {
+    if let Some(highlight) = highlight {
+        if let Some(highlight_foreground) = highlight.foreground {
+            foreground = highlight_foreground;
+        }
+        if let Some(highlight_background) = highlight.background {
+            background = highlight_background;
+        }
+    }
+
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    if flags.contains(Flags::DIM) {
+        foreground.a *= 0.7;
+    }
+
+    (foreground, background)
+}
+
 fn is_blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
     cell.c == ' '
         && cell.zerowidth().is_none()
@@ -965,7 +1005,14 @@ fn named_color(named: NamedColor, _foreground: bool, cx: &App) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::should_render_cursor;
+    use super::{resolve_cell_colors, should_render_cursor};
+    use crate::terminal::highlight::HighlightStyle;
+    use alacritty_terminal::term::cell::Flags;
+    use gpui::Hsla;
+
+    fn color(h: f32, s: f32, l: f32) -> Hsla {
+        Hsla { h, s, l, a: 1.0 }
+    }
 
     #[test]
     fn renders_cursor_only_for_focused_pane_in_focused_terminal_window() {
@@ -973,5 +1020,47 @@ mod tests {
         assert!(!should_render_cursor(false, true, true));
         assert!(!should_render_cursor(true, false, true));
         assert!(!should_render_cursor(true, true, false));
+    }
+
+    #[test]
+    fn applies_highlight_channels_before_inverse_terminal_style() {
+        let original_foreground = color(0.0, 0.0, 0.8);
+        let original_background = color(0.0, 0.0, 0.1);
+        let highlight_foreground = color(0.1, 0.8, 0.5);
+        let highlight_background = color(0.6, 0.8, 0.4);
+
+        let (foreground, background) = resolve_cell_colors(
+            original_foreground,
+            original_background,
+            Some(HighlightStyle {
+                foreground: Some(highlight_foreground),
+                background: Some(highlight_background),
+            }),
+            Flags::INVERSE,
+        );
+
+        assert_eq!(foreground, highlight_background);
+        assert_eq!(background, highlight_foreground);
+    }
+
+    #[test]
+    fn foreground_highlight_preserves_background_and_dim_style() {
+        let original_foreground = color(0.0, 0.0, 0.8);
+        let original_background = color(0.0, 0.0, 0.1);
+        let highlight_foreground = color(0.1, 0.8, 0.5);
+
+        let (foreground, background) = resolve_cell_colors(
+            original_foreground,
+            original_background,
+            Some(HighlightStyle {
+                foreground: Some(highlight_foreground),
+                background: None,
+            }),
+            Flags::DIM,
+        );
+
+        assert_eq!(foreground.alpha(1.0), highlight_foreground);
+        assert!((foreground.a - 0.7).abs() < f32::EPSILON);
+        assert_eq!(background, original_background);
     }
 }

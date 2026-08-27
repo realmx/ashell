@@ -345,7 +345,7 @@ impl Ashell {
             };
             (
                 session.id.clone(),
-                tab.cursor_state().map(|cursor| (cursor.row, cursor.col)),
+                tab.buffer_cursor_position(),
                 tab.is_alternate_screen_active(),
             )
         };
@@ -1284,6 +1284,11 @@ fn terminal_command_text(
     start: (usize, usize),
     end: Option<(usize, usize)>,
 ) -> Option<String> {
+    let start = buffer_position_in_viewport(snapshot, start)?;
+    let end = match end {
+        Some(position) => Some(buffer_position_in_viewport(snapshot, position)?),
+        None => None,
+    };
     let logical_lines =
         crate::terminal::highlight::build_logical_lines(&snapshot.cells, snapshot.rows);
     for line in logical_lines {
@@ -1315,42 +1320,38 @@ fn terminal_command_text(
     None
 }
 
+fn buffer_position_in_viewport(
+    snapshot: &crate::terminal::RenderSnapshot,
+    position: (usize, usize),
+) -> Option<(usize, usize)> {
+    let viewport_start = snapshot
+        .history_size
+        .saturating_sub(snapshot.display_offset);
+    let row = position.0.checked_sub(viewport_start)?;
+    (row < snapshot.rows && position.1 < snapshot.cols).then_some((row, position.1))
+}
+
 fn command_history_text(rendered: Option<&str>, buffered: &str, input_uncertain: bool) -> String {
+    let rendered = rendered.unwrap_or_default().trim();
     let buffered = buffered.trim();
     if !input_uncertain && !buffered.is_empty() {
         return buffered.to_string();
     }
-    merge_command_text(rendered, buffered)
-}
-
-fn merge_command_text(rendered: Option<&str>, buffered: &str) -> String {
-    let rendered = rendered.unwrap_or_default().trim();
-    let buffered = buffered.trim();
     if rendered.is_empty() {
         return buffered.to_string();
     }
     if buffered.is_empty() {
         return rendered.to_string();
     }
-    if rendered.starts_with(buffered) || rendered.ends_with(buffered) {
-        return rendered.to_string();
-    }
-    if buffered.starts_with(rendered) || buffered.ends_with(rendered) {
+    // Completion extends the current token; a new argument after exact raw input is stale content.
+    if rendered
+        .strip_prefix(buffered)
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(char::is_whitespace)
+    {
         return buffered.to_string();
     }
-
-    let overlap = buffered
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(buffered.len()))
-        .filter(|index| *index > 0 && rendered.ends_with(&buffered[..*index]))
-        .max()
-        .unwrap_or(0);
-    if overlap > 0 {
-        format!("{rendered}{}", &buffered[overlap..])
-    } else {
-        rendered.to_string()
-    }
+    rendered.to_string()
 }
 
 #[cfg(test)]
@@ -1582,6 +1583,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_whitespace_delimited_screen_suffix_when_input_is_uncertain() {
+        let command = "sh /site/jimureport/jimureport-restart.sh";
+        let rendered = format!("{command} /sijiji-r");
+
+        assert_eq!(
+            command_history_text(Some(rendered.as_str()), command, true),
+            command
+        );
+    }
+
+    #[test]
+    fn does_not_append_tab_completion_keystroke_fragments() {
+        let command = "sh /site/jimureport/jimureport-restart.sh";
+        let buffered = "sh /sijiji-r";
+
+        assert_eq!(command_history_text(Some(command), buffered, true), command);
+    }
+
+    #[test]
+    fn falls_back_to_raw_input_when_uncertain_screen_text_is_unavailable() {
+        let command = "sh /site/jimureport/jimureport-restart.sh";
+
+        assert_eq!(command_history_text(None, command, true), command);
+    }
+
+    #[test]
+    fn keeps_screen_completion_that_extends_the_current_argument() {
+        let buffered = "sh /site/jimu";
+        let rendered = "sh /site/jimureport/jimureport-restart.sh";
+
+        assert_eq!(
+            command_history_text(Some(rendered), buffered, true),
+            rendered
+        );
+    }
+
+    #[test]
+    fn excludes_hidden_screen_residue_from_rendered_command() {
+        let command = "sh /site/jimureport/jimureport-restart.sh";
+        let rendered = format!("$ {command} /sijiji-r");
+        let mut snapshot = snapshot(&[rendered.as_str()], rendered.len());
+        for cell in snapshot.cells.iter_mut().skip(2 + command.chars().count()) {
+            cell.cell.flags.insert(Flags::HIDDEN);
+        }
+
+        assert_eq!(
+            terminal_command_text(&snapshot, (0, 2), None),
+            Some(command.to_string())
+        );
+    }
+
+    #[test]
     fn truncates_rendered_command_at_the_submission_cursor() {
         let command = "sh /site/vocano/vocano-restart.sh";
         let rendered = format!("$ {command} /sivovo-re");
@@ -1590,6 +1643,28 @@ mod tests {
         assert_eq!(
             terminal_command_text(&snapshot, (0, 2), Some((0, 2 + command.len())),),
             Some(command.to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_command_coordinates_stable_when_wrapping_scrolls_the_viewport() {
+        let first_row = "$ sh /site/jimureport/jimureport-";
+        let second_row = "restart.sh /sijiji-r";
+        let mut snapshot = snapshot(&[first_row, second_row], first_row.len());
+        snapshot.history_size = 3;
+        snapshot.display_offset = 2;
+        snapshot
+            .cells
+            .iter_mut()
+            .find(|cell| cell.row == 0 && cell.col == first_row.len() as i32 - 1)
+            .unwrap()
+            .cell
+            .flags
+            .insert(Flags::WRAPLINE);
+
+        assert_eq!(
+            terminal_command_text(&snapshot, (1, 2), Some((2, "restart.sh".len()))),
+            Some("sh /site/jimureport/jimureport-restart.sh".to_string())
         );
     }
 }
