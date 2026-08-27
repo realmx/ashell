@@ -3285,6 +3285,51 @@ impl Ashell {
                                             );
                                         }
                                     }),
+                            )
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .mt_2()
+                                    .p_3()
+                                    .gap_2()
+                                    .rounded_md()
+                                    .bg(cx.theme().secondary.opacity(0.4))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .child(
+                                        div()
+                                            .text_size(ui_rems(0.85))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(cx.theme().foreground)
+                                            .child(t!("about_tips_title")),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .text_size(ui_rems(0.8))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_start()
+                                                    .child(div().flex_none().child("•"))
+                                                    .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_backspace"))),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_start()
+                                                    .child(div().flex_none().child("•"))
+                                                    .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_close_shortcuts"))),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_start()
+                                                    .child(div().flex_none().child("•"))
+                                                    .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_conflict_shortcuts"))),
+                                            ),
+                                    ),
                             ),
                     )
                 })
@@ -4428,6 +4473,51 @@ impl Ashell {
                                                                 .on_click(|_, _window, _cx| {
                                                                     let _ = open::that("https://github.com/rust-kotlin/ashell");
                                                                 }),
+                                                        )
+                                                        .child(
+                                                            v_flex()
+                                                                .w_full()
+                                                                .mt_3()
+                                                                .p_3()
+                                                                .gap_2()
+                                                                .rounded_md()
+                                                                .bg(cx.theme().secondary.opacity(0.4))
+                                                                .border_1()
+                                                                .border_color(cx.theme().border)
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(ui_rems(0.85))
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(cx.theme().foreground)
+                                                                        .child(t!("about_tips_title")),
+                                                                )
+                                                                .child(
+                                                                    v_flex()
+                                                                        .gap_2()
+                                                                        .text_size(ui_rems(0.8))
+                                                                        .text_color(cx.theme().muted_foreground)
+                                                                        .child(
+                                                                            h_flex()
+                                                                                .gap_2()
+                                                                                .items_start()
+                                                                                .child(div().flex_none().child("•"))
+                                                                                .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_backspace"))),
+                                                                        )
+                                                                        .child(
+                                                                            h_flex()
+                                                                                .gap_2()
+                                                                                .items_start()
+                                                                                .child(div().flex_none().child("•"))
+                                                                                .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_close_shortcuts"))),
+                                                                        )
+                                                                        .child(
+                                                                            h_flex()
+                                                                                .gap_2()
+                                                                                .items_start()
+                                                                                .child(div().flex_none().child("•"))
+                                                                                .child(div().flex_1().min_w(px(0.)).child(t!("about_tip_conflict_shortcuts"))),
+                                                                        ),
+                                                                ),
                                                         )
                                                 }))
                                         )
