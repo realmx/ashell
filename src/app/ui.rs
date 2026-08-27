@@ -3336,7 +3336,6 @@ impl Ashell {
         active_session_id: Option<&str>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let connect_id = session.id.clone();
         let edit_id = session.id.clone();
         let delete_id = session.id.clone();
         let management_mode = self.connection_management_mode;
@@ -3347,8 +3346,6 @@ impl Ashell {
         let selection_id = session.id.clone();
         let row_selection_id = selection_id.clone();
         let row_id = ElementId::Name(format!("saved-connect-{}", session.id).into());
-        let connect_button_id =
-            ElementId::Name(format!("connect-saved-session-{}", session.id).into());
 
         div()
             .id(row_id)
@@ -3477,33 +3474,7 @@ impl Ashell {
                             .text_size(ui_rems(0.75))
                             .text_color(cx.theme().muted_foreground)
                             .child(detail),
-                    )
-                    .when(management_mode, |this| {
-                        this.child(
-                            h_flex()
-                                .w(px(24.))
-                                .ml_1()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .child(
-                                    pointer_button(connect_button_id)
-                                        .ghost()
-                                        .small()
-                                        .icon(IconName::ExternalLink)
-                                        .tooltip(t!("connect").to_string())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.connect_saved_session(connect_id.clone(), window, cx);
-                                        })),
-                                ),
-                        )
-                    }),
+                    ),
             )
             .into_any_element()
     }

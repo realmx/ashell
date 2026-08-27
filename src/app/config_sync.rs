@@ -632,7 +632,8 @@ impl Ashell {
     }
 
     pub(crate) fn export_connections(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
-        if self.active_dialog.is_some() {
+        let parent_dialog = self.active_dialog;
+        if parent_dialog.is_some() && parent_dialog != Some(DialogKind::Settings) {
             return;
         }
 
@@ -695,7 +696,7 @@ impl Ashell {
                     let sessions = sessions_for_export.clone();
                     view_for_ok.update(cx, |this, cx| {
                         if this.active_dialog == Some(DialogKind::ConnectionExport) {
-                            this.active_dialog = None;
+                            this.active_dialog = parent_dialog;
                         }
                         this.start_connection_csv_export(sessions, window, cx);
                         cx.notify();
@@ -707,7 +708,7 @@ impl Ashell {
                     move |_, _, cx| {
                         view.update(cx, |this, cx| {
                             if this.active_dialog == Some(DialogKind::ConnectionExport) {
-                                this.active_dialog = None;
+                                this.active_dialog = parent_dialog;
                             }
                             cx.notify();
                         });
