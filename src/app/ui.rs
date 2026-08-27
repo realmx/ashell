@@ -34,7 +34,7 @@ use crate::{
         constants::{SIDEBAR_WIDTH, TERMINAL_KEY_CONTEXT, TERMINAL_SCROLLBAR_GUTTER},
         controls::{
             PointerClipboard, PointerSelectionCheckbox, SelectionState, pointer_button,
-            pointer_checkbox, pointer_switch, ui_rems,
+            pointer_checkbox, ui_rems,
         },
     },
     sftp::format_mtime,
@@ -3380,6 +3380,15 @@ impl Ashell {
                     }),
                 )
             })
+            .when(!management_mode, |this| {
+                let connect_id = session.id.clone();
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.connect_saved_session(connect_id.clone(), window, cx);
+                    }),
+                )
+            })
             .context_menu({
                 let view = cx.entity();
                 move |menu, window, _| {
@@ -3469,30 +3478,32 @@ impl Ashell {
                             .text_color(cx.theme().muted_foreground)
                             .child(detail),
                     )
-                    .child(
-                        h_flex()
-                            .w(px(24.))
-                            .ml_1()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .child(
-                                pointer_button(connect_button_id)
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::ExternalLink)
-                                    .tooltip(t!("connect").to_string())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.connect_saved_session(connect_id.clone(), window, cx);
-                                    })),
-                            ),
-                    ),
+                    .when(management_mode, |this| {
+                        this.child(
+                            h_flex()
+                                .w(px(24.))
+                                .ml_1()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    pointer_button(connect_button_id)
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::ExternalLink)
+                                        .tooltip(t!("connect").to_string())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.connect_saved_session(connect_id.clone(), window, cx);
+                                        })),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -3770,23 +3781,18 @@ impl Ashell {
                                     .child(t!("connection_management")),
                             )
                             .child(
-                                pointer_button("import-connections")
+                                pointer_button("toggle-connection-management-mode")
                                     .ghost()
                                     .small()
-                                    .icon(IconName::ArrowDown)
-                                    .label(t!("import_connections").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.import_connections(window, cx)
-                                    })),
-                            )
-                            .child(
-                                pointer_button("export-connections")
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::ArrowUp)
-                                    .label(t!("export_connections").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.export_connections(window, cx)
+                                    .when(management_mode, |this| this.icon(IconName::Check))
+                                    .label(if management_mode {
+                                        t!("done").to_string()
+                                    } else {
+                                        t!("edit").to_string()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let current = this.connection_management_mode;
+                                        this.set_connection_management_mode(!current, cx);
                                     })),
                             )
                             .child(
@@ -3805,15 +3811,27 @@ impl Ashell {
                             .w_full()
                             .min_w(px(0.)),
                     )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_1()
-                            .pl(px(5.))
-                            .py(px(4.))
-                            .when(management_mode, |this| {
-                                this.child(
+                    .when(management_mode, |this| {
+                        this.child(
+                            pointer_button("new-connection-group-fullwidth")
+                                .secondary()
+                                .w_full()
+                                .icon(IconName::Plus)
+                                .label(t!("new_connection_group").to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_connection_group_dialog(None, window, cx);
+                                })),
+                        )
+                    })
+                    .when(management_mode, |this| {
+                        this.child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_1()
+                                .pl(px(5.))
+                                .py(px(4.))
+                                .child(
                                     h_flex()
                                         .w(px(16.))
                                         .flex_none()
@@ -3845,20 +3863,8 @@ impl Ashell {
                                             "{selected_connections}/{total_connections}"
                                         )),
                                 )
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                pointer_button("new-connection-group")
-                                    .ghost()
-                                    .icon(IconName::Plus)
-                                    .label(t!("connection_group").to_string())
-                                    .tooltip(t!("new_connection_group").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.show_connection_group_dialog(None, window, cx);
-                                    })),
-                            )
-                            .when(management_mode, |this| {
-                                this.child({
+                                .child(div().flex_1())
+                                .child({
                                     let groups = connection_groups.clone();
                                     pointer_button("move-selected-connections")
                                         .ghost()
@@ -3899,9 +3905,7 @@ impl Ashell {
                                             }
                                         })
                                 })
-                            })
-                            .when(management_mode, |this| {
-                                this.child(
+                                .child(
                                     pointer_button("delete-selected-connections")
                                         .danger()
                                         .icon(IconName::Delete)
@@ -3910,18 +3914,9 @@ impl Ashell {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.remove_selected_sessions(cx);
                                         })),
-                                )
-                            })
-                            .child(
-                                pointer_switch("connection-management-mode")
-                                    .small()
-                                    .checked(management_mode)
-                                    .tooltip(t!("manage_connections").to_string())
-                                    .on_click(cx.listener(|this, checked, _, cx| {
-                                        this.set_connection_management_mode(*checked, cx);
-                                    })),
-                            ),
-                    )
+                                ),
+                        )
+                    })
                     .child(
                         h_flex()
                             .relative()
@@ -4492,7 +4487,6 @@ impl Ashell {
                                                                 } else {
                                                                     0.45
                                                                 })
-                                                                .hover(|style| style.opacity(1.0))
                                                                 .on_mouse_down(
                                                                     MouseButton::Left,
                                                                     |_, window, cx| {
@@ -4566,11 +4560,11 @@ impl Ashell {
                                                 )),
                                         )
                                         .item(
-                                            PopupMenuItem::new(t!("new_connection").to_string())
+                                            PopupMenuItem::new(t!("open_connection").to_string())
                                                 .on_click(window.listener_for(
                                                     &view,
                                                     |this, _, window, cx| {
-                                                        this.open_new_ssh_dialog(window, cx);
+                                                        this.show_selector_dialog(window, cx);
                                                     },
                                                 )),
                                         )
@@ -5462,7 +5456,7 @@ impl Render for Ashell {
                     .workspace_panels()
                     .and_then(|s| s.first().copied())
                     .unwrap_or(SIDEBAR_WIDTH)))
-                .size_range(px(310.)..px(520.))
+                .size_range(px(200.)..px(520.))
                 .flex_none()
                 .child(self.sidebar(cx));
 

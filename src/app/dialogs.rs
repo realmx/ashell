@@ -4173,6 +4173,33 @@ impl Ashell {
                                                         }
                                                     })
                                                 ))
+                                                .item(SettingItem::new(
+                                                    t!("import_export_connections").to_string(),
+                                                    SettingField::render({
+                                                        let view = view.clone();
+                                                        move |_, window, _cx| {
+                                                            h_flex()
+                                                                .gap_2()
+                                                                .child(
+                                                                    pointer_button("settings-connections-import")
+                                                                        .icon(IconName::ArrowDown)
+                                                                        .label(t!("import_connections").to_string())
+                                                                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                                            this.import_connections(window, cx);
+                                                                        }))
+                                                                )
+                                                                .child(
+                                                                    pointer_button("settings-connections-export")
+                                                                        .icon(IconName::ArrowUp)
+                                                                        .label(t!("export_connections").to_string())
+                                                                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                                                                            this.export_connections(window, cx);
+                                                                        }))
+                                                                )
+                                                                .into_any_element()
+                                                        }
+                                                    })
+                                                ))
                                         )
                                 )
                                 .page(

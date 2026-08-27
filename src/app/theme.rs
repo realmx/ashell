@@ -17,6 +17,49 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) static USING_SYSTEM_MAPLE: AtomicBool = AtomicBool::new(false);
 
+pub(crate) const COMMON_SYSTEM_UI_FONTS: &[&str] = &[
+    "Helvetica",
+    "Segoe UI",
+    "Ubuntu",
+    "Adwaita Sans",
+    "Cantarell",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Arial",
+    "San Francisco",
+    ".SF NS Text",
+    ".SF NS Display",
+    "Segoe UI Variable",
+    "PingFang SC",
+    "Microsoft YaHei",
+    "SimSun",
+];
+
+pub(crate) fn resolve_safe_ui_font(cx: &App, requested_font: &str) -> String {
+    let all_fonts = cx.text_system().all_font_names();
+    if requested_font == ".SystemUIFont" {
+        let has_system_ui = COMMON_SYSTEM_UI_FONTS
+            .iter()
+            .any(|font| all_fonts.contains(&font.to_string()));
+        if has_system_ui {
+            ".SystemUIFont".to_string()
+        } else {
+            "Maple Mono NF CN".to_string()
+        }
+    } else if all_fonts.contains(&requested_font.to_string()) {
+        requested_font.to_string()
+    } else {
+        let has_system_ui = COMMON_SYSTEM_UI_FONTS
+            .iter()
+            .any(|font| all_fonts.contains(&font.to_string()));
+        if has_system_ui {
+            ".SystemUIFont".to_string()
+        } else {
+            "Maple Mono NF CN".to_string()
+        }
+    }
+}
+
 pub(crate) fn load_fonts(cx: &mut App) -> Result<()> {
     let has_system_maple = cx
         .text_system()
@@ -35,7 +78,8 @@ pub(crate) fn load_fonts(cx: &mut App) -> Result<()> {
             .add_fonts(vec![regular, bold])
             .context("load Maple Mono NF CN fonts")?;
     }
-    set_theme_font_names(cx.global_mut::<Theme>(), ".SystemUIFont");
+    let safe_font = resolve_safe_ui_font(cx, ".SystemUIFont");
+    set_theme_font_names(cx.global_mut::<Theme>(), &safe_font);
     Ok(())
 }
 
@@ -159,11 +203,12 @@ impl Ashell {
             .get(&self.dark_theme_name)
             .cloned()
             .unwrap_or_else(|| ThemeRegistry::global(cx).default_dark_theme().clone());
+        let safe_font = resolve_safe_ui_font(cx, &self.ui_font_family);
         let theme = Theme::global_mut(cx);
         theme.light_theme = light_theme;
         theme.dark_theme = dark_theme;
         theme.font_size = px(self.ui_font_size);
-        set_theme_font_names(theme, &self.ui_font_family);
+        set_theme_font_names(theme, &safe_font);
 
         if self.follow_system_theme {
             Theme::sync_system_appearance(Some(window), cx);
