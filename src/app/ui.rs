@@ -4351,12 +4351,13 @@ impl Ashell {
                                                 pane_ids.iter().any(|id| {
                                                     self.unread_terminal_notifications.contains(id)
                                                 });
-                                            let output_active = pane_ids.iter().any(|id| {
-                                                self.tabs
-                                                    .iter()
-                                                    .find(|tab| tab.id == *id)
-                                                    .is_some_and(TerminalTab::is_command_active)
-                                            });
+                                            let output_active = ix != selected
+                                                && pane_ids.iter().any(|id| {
+                                                    self.tabs
+                                                        .iter()
+                                                        .find(|tab| tab.id == *id)
+                                                        .is_some_and(TerminalTab::has_recent_output)
+                                                });
                                             h_flex()
                                                 .id(("ashell-tab", ix))
                                                 .relative()

@@ -953,30 +953,67 @@ fn find_urls(text: &str) -> Vec<usize> {
 }
 
 fn find_url_len(text: &str) -> usize {
-    let end = text
-        .find(|c: char| c.is_ascii_whitespace())
-        .unwrap_or(text.len());
-    let mut url = &text[..end];
-
-    loop {
-        let Some(&closing) = url.as_bytes().last() else {
-            break;
-        };
-        let opening = match closing {
-            b')' => b'(',
-            b']' => b'[',
-            b'}' => b'{',
-            _ => break,
-        };
-        let opening_count = url.bytes().filter(|byte| *byte == opening).count();
-        let closing_count = url.bytes().filter(|byte| *byte == closing).count();
-        if closing_count <= opening_count {
+    let mut end = text.len();
+    let mut expected_closings = Vec::new();
+    for (index, character) in text.char_indices() {
+        if is_url_terminator(character) {
+            end = index;
             break;
         }
-        url = &url[..url.len() - 1];
+
+        match character {
+            '(' => expected_closings.push(')'),
+            '[' => expected_closings.push(']'),
+            '{' => expected_closings.push('}'),
+            ')' | ']' | '}' => {
+                if expected_closings.last() == Some(&character) {
+                    expected_closings.pop();
+                } else {
+                    end = index;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut url = &text[..end];
+    while let Some(character) = url.chars().next_back() {
+        if !matches!(character, ',' | '.' | ';' | ':' | '!' | '?') {
+            break;
+        }
+        url = &url[..url.len() - character.len_utf8()];
     }
 
     url.len()
+}
+
+fn is_url_terminator(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '，'
+                | '。'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '、'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+        )
 }
 
 fn find_ports(text: &str) -> Vec<usize> {
@@ -1172,6 +1209,28 @@ mod tests {
         assert_eq!(
             detected_url("https://example.com/path_(one))] following text"),
             "https://example.com/path_(one)"
+        );
+    }
+
+    #[test]
+    fn stops_before_text_after_an_unmatched_closing_delimiter() {
+        assert_eq!(
+            detected_url(
+                "https://github.com/gnachman/iTerm2/blob/master/sources/PTYSession/PTYSession.m#L6371-L6380)、PTYTab.m"
+            ),
+            "https://github.com/gnachman/iTerm2/blob/master/sources/PTYSession/PTYSession.m#L6371-L6380"
+        );
+    }
+
+    #[test]
+    fn excludes_chinese_and_ascii_trailing_punctuation() {
+        assert_eq!(
+            detected_url("https://example.com/path、后续文字"),
+            "https://example.com/path"
+        );
+        assert_eq!(
+            detected_url("https://example.com/path, next"),
+            "https://example.com/path"
         );
     }
 

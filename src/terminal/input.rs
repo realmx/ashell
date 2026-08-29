@@ -209,7 +209,7 @@ impl Ashell {
         }
 
         tab.clear_selection();
-        tab.record_terminal_input(&bytes);
+        tab.prepare_for_terminal_input();
         let encoded = tab.encode_input(&bytes);
         tab.send_backend(BackendCommand::Input(encoded));
         window.prevent_default();
@@ -325,7 +325,7 @@ impl Ashell {
         }
         tab.clear_selection();
         self.terminal_marked_text = None;
-        tab.record_terminal_input(&bytes);
+        tab.prepare_for_terminal_input();
         let encoded = tab.encode_input(&bytes);
         tab.send_backend(BackendCommand::Input(encoded));
         window.invalidate_character_coordinates();

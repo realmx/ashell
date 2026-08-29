@@ -37,7 +37,7 @@ pub enum TabKind {
     Serial,
 }
 
-const TERMINAL_ACTIVITY_GRACE: Duration = Duration::from_millis(750);
+const TERMINAL_ACTIVITY_GRACE: Duration = Duration::from_secs(2);
 const CLICK_CURSOR_PREDICTION_TTL: Duration = Duration::from_millis(750);
 const MAX_OSC_PAYLOAD_BYTES: usize = 4096;
 const MAX_NOTIFICATION_TEXT_BYTES: usize = 8192;
@@ -242,27 +242,39 @@ struct OscTerminalParser {
     pending_osc99: HashMap<String, PendingOsc99Notification>,
 }
 
+struct OscTerminalScan {
+    events: Vec<(usize, OscTerminalEvent)>,
+    has_terminal_output: bool,
+}
+
 impl OscTerminalParser {
     /// Scans decoded terminal output without consuming it from the terminal emulator.
     #[cfg(test)]
     fn advance(&mut self, bytes: &[u8]) -> Vec<OscTerminalEvent> {
         self.advance_with_offsets(bytes)
+            .events
             .into_iter()
             .map(|(_, event)| event)
             .collect()
     }
 
-    fn advance_with_offsets(&mut self, bytes: &[u8]) -> Vec<(usize, OscTerminalEvent)> {
+    fn advance_with_offsets(&mut self, bytes: &[u8]) -> OscTerminalScan {
         let mut events = Vec::new();
+        let mut has_terminal_output = false;
 
         for (index, &byte) in bytes.iter().enumerate() {
             match self.state {
                 OscTerminalState::Ground => {
                     if byte == 0x1b {
                         self.state = OscTerminalState::Escape;
+                    } else {
+                        has_terminal_output = true;
                     }
                 }
                 OscTerminalState::Escape => {
+                    if byte != b']' && byte != 0x1b {
+                        has_terminal_output = true;
+                    }
                     self.state = match byte {
                         b']' => {
                             self.command.clear();
@@ -333,7 +345,10 @@ impl OscTerminalParser {
             }
         }
 
-        events
+        OscTerminalScan {
+            events,
+            has_terminal_output,
+        }
     }
 
     fn push_payload_byte(&mut self, byte: u8) {
@@ -869,8 +884,6 @@ pub struct TerminalTab {
     output_decoder: StreamingDecoder,
     osc_terminal_parser: OscTerminalParser,
     output_activity_until: Option<Instant>,
-    command_running: bool,
-    shell_integration_available: bool,
     processor: Processor,
     term: Term<TerminalListener>,
     pub cols: u16,
@@ -1283,7 +1296,7 @@ mod terminal_tab_backend_tests {
         );
 
         tab.note_click_cursor_move_at(predicted, now);
-        tab.record_terminal_input(b"x");
+        tab.prepare_for_terminal_input();
         assert_eq!(tab.cursor_state_for_click_at(now), actual);
     }
 }
@@ -1543,12 +1556,67 @@ mod osc_terminal_tests {
     }
 
     #[test]
+    fn distinguishes_terminal_output_from_osc_signaling() {
+        let mut parser = OscTerminalParser::default();
+
+        let shell_marker = parser.advance_with_offsets(b"\x1b]133;C\x07");
+        assert!(!shell_marker.has_terminal_output);
+        assert_eq!(
+            shell_marker.events,
+            vec![(b"\x1b]133;C\x07".len(), OscTerminalEvent::CommandStarted)]
+        );
+
+        let output = parser.advance_with_offsets(b"server ready\r\n");
+        assert!(output.has_terminal_output);
+        assert!(output.events.is_empty());
+
+        let mixed = parser.advance_with_offsets(b"built\r\n\x1b]133;D;0\x07");
+        assert!(mixed.has_terminal_output);
+        assert_eq!(mixed.events.len(), 1);
+    }
+
+    #[test]
+    fn excludes_osc_signaling_split_across_output_chunks() {
+        let mut parser = OscTerminalParser::default();
+
+        assert!(
+            !parser
+                .advance_with_offsets(b"\x1b]133;")
+                .has_terminal_output
+        );
+        let completed = parser.advance_with_offsets(b"C\x07");
+        assert!(!completed.has_terminal_output);
+        assert_eq!(completed.events.len(), 1);
+    }
+
+    #[test]
+    fn shell_integration_markers_do_not_drive_tab_output_activity() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let mut tab = TerminalTab::new_local(
+            "tab-1".into(),
+            "Local".into(),
+            BackendTx::Pending,
+            GuardedBackendEventSender::new(events_tx),
+        );
+
+        tab.feed(b"\x1b]133;C\x07");
+        assert!(!tab.has_recent_output());
+
+        tab.feed(b"server ready\r\n");
+        assert!(tab.has_recent_output());
+
+        tab.feed(b"\x1b]133;D;0\x07");
+        assert!(tab.has_recent_output());
+    }
+
+    #[test]
     fn parses_prompt_click_modes_and_preserves_event_offsets() {
         let mut parser = OscTerminalParser::default();
         let bytes = b"prefix\x1b]133;A;click_events=2\x07suffix";
 
         let (event_end, event) = parser
             .advance_with_offsets(bytes)
+            .events
             .into_iter()
             .next()
             .expect("prompt marker event");
@@ -1807,8 +1875,6 @@ impl TerminalTab {
             output_decoder: StreamingDecoder::new(TextEncoding::Utf8),
             osc_terminal_parser: OscTerminalParser::default(),
             output_activity_until: None,
-            command_running: false,
-            shell_integration_available: false,
             processor: Processor::new(),
             term: new_term(100, 30, shared_backend.clone(), id, events.clone()),
             cols: 100,
@@ -1825,12 +1891,13 @@ impl TerminalTab {
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalNotification> {
         let decoded = self.output_decoder.decode(bytes);
-        if !decoded.is_empty() {
+        let scan = self.osc_terminal_parser.advance_with_offsets(&decoded);
+        if scan.has_terminal_output {
             self.output_activity_until = Some(Instant::now() + TERMINAL_ACTIVITY_GRACE);
         }
         let mut notifications = Vec::new();
         let mut processed_until = 0;
-        for (event_end, event) in self.osc_terminal_parser.advance_with_offsets(&decoded) {
+        for (event_end, event) in scan.events {
             self.processor
                 .advance(&mut self.term, &decoded[processed_until..event_end]);
             self.handle_osc_terminal_event(event, &mut notifications);
@@ -1850,8 +1917,6 @@ impl TerminalTab {
     ) {
         match event {
             OscTerminalEvent::Notification(notification) => {
-                self.command_running = false;
-                self.output_activity_until = None;
                 notifications.push(notification);
             }
             OscTerminalEvent::ProtocolReply(reply) => {
@@ -1862,9 +1927,6 @@ impl TerminalTab {
                 secondary,
             } => {
                 self.clear_click_cursor_prediction();
-                self.shell_integration_available = true;
-                self.command_running = false;
-                self.output_activity_until = None;
                 let prompt_start = self.buffer_cursor_position().unwrap_or((0, 0));
                 if secondary {
                     if let Some(prompt_input) = self.prompt_input.as_mut() {
@@ -1907,15 +1969,10 @@ impl TerminalTab {
             }
             OscTerminalEvent::CommandStarted => {
                 self.clear_click_cursor_prediction();
-                self.shell_integration_available = true;
-                self.command_running = true;
                 self.prompt_input = None;
             }
             OscTerminalEvent::CommandFinished => {
                 self.clear_click_cursor_prediction();
-                self.shell_integration_available = true;
-                self.command_running = false;
-                self.output_activity_until = None;
                 self.prompt_input = None;
             }
         }
@@ -1944,9 +2001,8 @@ impl TerminalTab {
         true
     }
 
-    pub(crate) fn is_command_active(&self) -> bool {
-        (self.command_running && !self.is_alternate_screen_active())
-            || self.output_activity_until.is_some()
+    pub(crate) fn has_recent_output(&self) -> bool {
+        self.output_activity_until.is_some()
     }
 
     pub(crate) fn expire_output_activity(&mut self, now: Instant) -> bool {
@@ -1961,22 +2017,13 @@ impl TerminalTab {
         }
     }
 
-    pub(crate) fn record_terminal_input(&mut self, bytes: &[u8]) {
+    pub(crate) fn prepare_for_terminal_input(&mut self) {
         self.clear_click_cursor_prediction();
-        if self.shell_integration_available
-            && !self.is_alternate_screen_active()
-            && bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
-        {
-            self.command_running = true;
-            self.output_activity_until = None;
-        }
     }
 
-    pub(crate) fn clear_command_activity(&mut self) -> bool {
-        let changed = self.command_running || self.output_activity_until.is_some();
-        self.command_running = false;
+    pub(crate) fn clear_terminal_activity(&mut self) -> bool {
+        let changed = self.output_activity_until.is_some();
         self.output_activity_until = None;
-        self.shell_integration_available = false;
         self.prompt_input = None;
         self.clear_click_cursor_prediction();
         self.osc_terminal_parser = OscTerminalParser::default();
@@ -2005,7 +2052,6 @@ impl TerminalTab {
         self.output_decoder = StreamingDecoder::new(encoding);
         self.osc_terminal_parser = OscTerminalParser::default();
         self.output_activity_until = None;
-        self.command_running = false;
         self.prompt_input = None;
         self.clear_click_cursor_prediction();
         if let Some(session) = self.session.as_mut() {

@@ -1565,7 +1565,7 @@ impl Ashell {
                         continue;
                     }
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.clear_command_activity();
+                        tab.clear_terminal_activity();
                         tab.connected = false;
                         tab.status = reason.clone();
                         tab.disconnected_reason = Some(reason.clone());
