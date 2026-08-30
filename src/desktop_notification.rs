@@ -98,7 +98,7 @@ fn show_windows_notification(
         .text2(body)
         .duration(winrt_notification::Duration::Short)
         .sound(None)
-        .on_activated(move || {
+        .on_activated(move |_| {
             queue_terminal_notification_activation(activation_tab_id.clone());
             Ok(())
         })
@@ -225,9 +225,11 @@ fn set_windows_taskbar_badge(window_handle: isize, unread: bool) -> windows::cor
         unsafe { CoCreateInstance(&TaskbarList, None::<&IUnknown>, CLSCTX_INPROC_SERVER)? };
     unsafe { taskbar.HrInit()? };
 
-    let hwnd = HWND(window_handle);
+    let hwnd = HWND(window_handle as *mut std::ffi::c_void);
     if !unread {
-        return unsafe { taskbar.SetOverlayIcon(hwnd, HICON(0), PCWSTR::null()) };
+        return unsafe {
+            taskbar.SetOverlayIcon(hwnd, HICON(std::ptr::null_mut()), PCWSTR::null())
+        };
     }
 
     let icon_resource = windows_badge_icon_resource();
