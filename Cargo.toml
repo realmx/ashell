@@ -23,7 +23,8 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 menu = { git = "https://github.com/zed-industries/zed" }
 portable-pty = "0.9.0"
 rfd = "0.17.2"
-russh = "0.63.1"
+# Reuse ring so Windows x86/x64 builds do not require aws-lc-sys and NASM.
+russh = { version = "0.63.1", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "2.4.0"
 rust-i18n = "3"
 sys-locale = "0.3"
