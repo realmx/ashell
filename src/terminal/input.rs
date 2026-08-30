@@ -822,7 +822,7 @@ impl Ashell {
             if self.terminal_zoom_accumulator.abs() >= step {
                 let zoom_steps = (self.terminal_zoom_accumulator / step).trunc();
                 self.terminal_zoom_accumulator -= zoom_steps * step;
-                self.change_terminal_font_size(zoom_steps * 0.5, cx);
+                self.change_terminal_font_size(zoom_steps * 0.5, window, cx);
             }
             window.prevent_default();
             cx.stop_propagation();

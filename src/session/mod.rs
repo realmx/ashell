@@ -1004,12 +1004,18 @@ impl Ashell {
         (self.terminal_font_size * 1.385).max(self.terminal_font_size + 2.0)
     }
 
-    pub(crate) fn change_terminal_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+    pub(crate) fn change_terminal_font_size(
+        &mut self,
+        delta: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.terminal_font_size = (self.terminal_font_size + delta).clamp(10.0, 24.0);
         self.config.set_terminal_font_size(self.terminal_font_size);
         self.save_preferences_background();
         self.status = format!("terminal font size: {:.0}px", self.terminal_font_size).into();
         cx.notify();
+        window.refresh();
     }
 
     pub(crate) fn change_ui_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
