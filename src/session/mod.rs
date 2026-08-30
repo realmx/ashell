@@ -2293,9 +2293,6 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.focused_pane_path.is_empty() {
-            return;
-        }
         let previous_active_tab = self.active_tab.clone();
         let mut active_tab_changed = false;
         let path = self.focused_pane_path.clone();
@@ -2319,6 +2316,28 @@ impl Ashell {
                 }
             }
             cx.notify();
+        } else if (direction == "left" || direction == "right") && self.tab_groups.len() > 1 {
+            if let Some(current_group_id) = self.active_group.clone() {
+                if let Some(current_idx) = self
+                    .tab_groups
+                    .iter()
+                    .position(|g| g.id == current_group_id)
+                {
+                    let total_groups = self.tab_groups.len();
+                    let target_idx = if direction == "left" {
+                        if current_idx > 0 {
+                            current_idx - 1
+                        } else {
+                            total_groups - 1
+                        }
+                    } else {
+                        (current_idx + 1) % total_groups
+                    };
+                    let target_group_id = self.tab_groups[target_idx].id.clone();
+                    self.activate_group(target_group_id, window, cx);
+                    return;
+                }
+            }
         }
         if active_tab_changed {
             self.update_terminal_focus(previous_active_tab.as_deref());
@@ -2446,7 +2465,13 @@ impl Ashell {
             }
         }
         // Load new group state
-        if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
+        if let Some((index, group)) = self
+            .tab_groups
+            .iter()
+            .enumerate()
+            .find(|(_, g)| g.id == group_id)
+        {
+            self.tabs_scroll_handle.scroll_to_item(index);
             self.pane_root = group.pane_root.clone();
             self.active_group = Some(group_id);
             if let Some(first_id) = group.pane_root.first_tab_id() {
