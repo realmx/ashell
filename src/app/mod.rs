@@ -2,6 +2,7 @@ pub mod config_sync;
 pub mod constants;
 pub mod controls;
 pub mod dialogs;
+pub(crate) mod host_keys;
 pub mod keybinding_recorder;
 pub mod resizable;
 pub mod search;
@@ -77,6 +78,22 @@ fn merge_adjacent_output(
     next: BackendEvent,
 ) -> Result<usize, BackendEvent> {
     match next {
+        BackendEvent::Guarded {
+            current_generation,
+            generation,
+            event,
+        } => {
+            if current_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+                return Ok(0);
+            }
+            // A lookahead event may remain pending across a reconnect. Preserve
+            // its guard so the next drain checks the generation again.
+            merge_adjacent_output(tab_id, bytes, *event).map_err(|event| BackendEvent::Guarded {
+                current_generation,
+                generation,
+                event: Box::new(event),
+            })
+        }
         BackendEvent::Output {
             tab_id: next_tab_id,
             bytes: next_bytes,
@@ -103,8 +120,26 @@ pub(crate) struct TabGroup {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) pane_root: PaneLayout,
+    pub(crate) focused_tab_id: Option<String>,
     pub(crate) sftp: Option<crate::terminal::SftpUiState>,
     pub(crate) sftp_tab_id: Option<String>,
+}
+
+impl TabGroup {
+    /// Remember a pane by its stable ID so splitting or resizing cannot move the focus.
+    pub(crate) fn remember_focus(&mut self, tab_id: Option<&str>) {
+        if let Some(tab_id) = tab_id.filter(|id| !id.is_empty() && self.pane_root.contains(id)) {
+            self.focused_tab_id = Some(tab_id.to_string());
+        }
+    }
+
+    /// Restore this group's last focused pane, falling back if it has been closed.
+    pub(crate) fn focus_target(&self) -> Option<&str> {
+        self.focused_tab_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && self.pane_root.contains(id))
+            .or_else(|| self.pane_root.first_tab_id().filter(|id| !id.is_empty()))
+    }
 }
 
 impl PaneLayout {
@@ -297,10 +332,12 @@ pub(crate) enum DialogKind {
     NewSsh,
     ConnectionGroup,
     SftpRename,
+    SftpDelete,
     SftpEditor,
     Processes,
     Ports,
     SshReconnect,
+    HostKeyVerification,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -347,6 +384,8 @@ pub(crate) struct Ashell {
     pub(crate) sync_s3_session_token_input: Entity<InputState>,
     pub(crate) sync_encryption_password_input: Entity<InputState>,
     pub(crate) sync_in_progress: bool,
+    pub(crate) sync_generation: u64,
+    pub(crate) sync_cancellation: Option<crate::backend::connection::Cancellation>,
     pub(crate) sync_status: SharedString,
     pub(crate) sftp_path_input: Entity<InputState>,
     pub(crate) remote_process_filter_input: Entity<InputState>,
@@ -446,6 +485,8 @@ pub(crate) struct Ashell {
     pub(crate) system_sampler: SystemSampler,
     pub(crate) recording_action: Option<String>,
     pub(crate) active_dialog: Option<DialogKind>,
+    pub(crate) pending_host_keys: Vec<crate::session::host_keys::HostKeyRequest>,
+    pub(crate) host_key_error: Option<String>,
     /// Error message when a recorded keybinding conflicts with another
     pub(crate) keybind_error: Option<(String, String)>, // (action_id, error_message)
     /// Whether workspace keybindings are currently suspended (during settings)
@@ -483,6 +524,7 @@ pub(crate) struct Ashell {
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
     pub(crate) last_window_bounds: Option<gpui::WindowBounds>,
     pub(crate) window_bounds_save_task: Option<gpui::Task<()>>,
+    pub(crate) transfer_save_task: Option<gpui::Task<()>>,
     pub(crate) save_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(crate) save_latest_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -518,6 +560,8 @@ pub(crate) struct SftpContextMenuState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SftpRenameState {
+    pub(crate) id: String,
+    pub(crate) connection_id: String,
     pub(crate) group_id: String,
     pub(crate) old_path: String,
     pub(crate) in_flight: bool,
@@ -538,6 +582,8 @@ pub(crate) enum SftpEditorInteraction {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SftpEditorState {
+    pub(crate) id: String,
+    pub(crate) connection_id: String,
     pub(crate) group_id: String,
     pub(crate) remote_path: String,
     pub(crate) raw_content: Vec<u8>,
@@ -548,6 +594,7 @@ pub(crate) struct SftpEditorState {
     pub(crate) loaded: bool,
     pub(crate) loading: bool,
     pub(crate) saving: bool,
+    pub(crate) confirm_close: bool,
     pub(crate) message: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) bounds: Bounds<Pixels>,
@@ -639,7 +686,7 @@ impl Ashell {
         });
         let config = ConfigStore::load().unwrap_or_else(|err| {
             tracing::warn!("failed to load config: {err:#}");
-            ConfigStore::in_memory()
+            ConfigStore::degraded(format!("{err:#}"))
         });
         let global_proxy_host_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -862,6 +909,8 @@ impl Ashell {
             sync_s3_session_token_input,
             sync_encryption_password_input,
             sync_in_progress: false,
+            sync_generation: 0,
+            sync_cancellation: None,
             sync_status: t!("sync_not_run").into(),
             sftp_path_input,
             remote_process_filter_input,
@@ -930,11 +979,7 @@ impl Ashell {
             transfers: {
                 let mut transfers = config.transfers();
                 for t in transfers.iter_mut() {
-                    if matches!(
-                        t.state,
-                        crate::terminal::TransferState::Running
-                            | crate::terminal::TransferState::Paused
-                    ) {
+                    if t.state.is_active() {
                         t.state =
                             crate::terminal::TransferState::Zombie(t!("zombie_reason").to_string());
                     }
@@ -974,6 +1019,8 @@ impl Ashell {
             system_sampler,
             recording_action: None,
             active_dialog: None,
+            pending_host_keys: Vec::new(),
+            host_key_error: None,
             keybind_error: None,
             keybinds_suspended: false,
             system,
@@ -1009,6 +1056,7 @@ impl Ashell {
             _subscriptions,
             last_window_bounds: Some(window.window_bounds()),
             window_bounds_save_task: None,
+            transfer_save_task: None,
             save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             save_latest_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1165,6 +1213,9 @@ impl Ashell {
     }
 
     pub(crate) fn save_preferences_background(&mut self) {
+        if self.config.read_only_reason().is_some() {
+            return;
+        }
         let local_config = self.config.cache.clone();
         let config_store = self.config.clone();
         let latest_seq = self.save_latest_seq.clone();
@@ -1320,6 +1371,14 @@ impl Ashell {
 
     pub(crate) fn update_terminal_focus(&mut self, previous_tab_id: Option<&str>) {
         let active_tab_id = self.active_tab.clone();
+        // Mouse focus, keyboard navigation and split/close actions all pass here.
+        if let Some(group) = self
+            .tab_groups
+            .iter_mut()
+            .find(|group| self.active_group.as_deref() == Some(group.id.as_str()))
+        {
+            group.remember_focus(active_tab_id.as_deref());
+        }
         if previous_tab_id != active_tab_id.as_deref() {
             if let Some(previous_tab_id) = previous_tab_id {
                 if let Some(tab) = self.tabs.iter().find(|tab| tab.id == previous_tab_id) {
@@ -1449,10 +1508,6 @@ impl Ashell {
                     let Ok(next) = self.events_rx.try_recv() else {
                         break;
                     };
-                    let Some(next) = next.into_current() else {
-                        outcome.processed_events += 1;
-                        continue;
-                    };
                     match merge_adjacent_output(tab_id, bytes, next) {
                         Ok(appended) => {
                             outcome.processed_events += 1;
@@ -1468,6 +1523,27 @@ impl Ashell {
 
             outcome.changed = true;
             match event {
+                BackendEvent::HostKeyVerification(request) => {
+                    self.pending_host_keys
+                        .retain(|pending| pending.is_current());
+                    if !request.is_current() {
+                        continue;
+                    }
+                    if let Some(pending) = self.pending_host_keys.iter_mut().find(|pending| {
+                        pending.tab_id == request.tab_id
+                            && pending.host == request.host
+                            && pending.port == request.port
+                            && pending.identity == request.identity
+                    }) {
+                        // The terminal prompt remains actionable if SFTP is
+                        // rebound to another pane before confirmation opens.
+                        if request.sftp_attempt.is_none() {
+                            *pending = request;
+                        }
+                    } else {
+                        self.pending_host_keys.push(request);
+                    }
+                }
                 BackendEvent::Guarded { .. } => unreachable!("guarded events are unwrapped above"),
                 BackendEvent::Output { tab_id, bytes } => {
                     let notifications = self
@@ -1666,6 +1742,7 @@ impl Ashell {
                     }
                 }
                 BackendEvent::Closed { tab_id, reason } => {
+                    self.clear_ssh_input_tracking(&tab_id);
                     let is_graceful_exit =
                         reason == "local shell closed" || reason == "ssh session closed";
                     if is_graceful_exit {
@@ -1703,12 +1780,12 @@ impl Ashell {
                     state,
                 } => {
                     if let Some(t) = self.transfers.iter_mut().find(|t| t.info.id == id) {
-                        t.transferred = transferred;
-                        if let Some(total) = total {
-                            t.total = Some(total);
-                        }
-                        t.state = state;
-                        transfers_changed = true;
+                        transfers_changed |= t.apply_progress(transferred, total, state);
+                    }
+                }
+                BackendEvent::TransferInterrupted { id, reason } => {
+                    if let Some(transfer) = self.transfers.iter_mut().find(|t| t.info.id == id) {
+                        transfers_changed |= transfer.interrupt(reason);
                     }
                 }
                 BackendEvent::TransferStarted { tab_id, info } => {
@@ -1721,12 +1798,9 @@ impl Ashell {
                             info,
                             transferred: 0,
                             total: None,
-                            state: crate::terminal::TransferState::Running,
+                            state: crate::terminal::TransferState::Queued,
                         },
                     );
-                    if self.transfers.len() > 100 {
-                        self.transfers.truncate(100);
-                    }
                     transfers_changed = true;
                 }
                 BackendEvent::SftpHome { tab_id, home } => {
@@ -1787,8 +1861,12 @@ impl Ashell {
                 BackendEvent::LocalDirectoryChanged { tab_id, path } => {
                     self.apply_local_directory_change(&tab_id, path);
                 }
-                BackendEvent::SyncFinished(result) => {
+                BackendEvent::SyncFinished { generation, result } => {
+                    if generation != self.sync_generation {
+                        continue;
+                    }
                     self.sync_in_progress = false;
+                    self.sync_cancellation = None;
                     match result {
                         crate::sync::SyncResult::Uploaded { etag } => {
                             if etag.is_some() {
@@ -1817,7 +1895,7 @@ impl Ashell {
             }
         }
         if transfers_changed {
-            self.config.set_transfers(self.transfers.clone());
+            self.save_transfer_records(cx);
         }
 
         let limit_reached = !backend_drain_budget_allows_more(
@@ -2061,85 +2139,109 @@ impl Ashell {
         ))
     }
 
-    pub(crate) fn remove_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
-        self.transfers.retain(|t| t.info.id != transfer_id);
-        self.config.set_transfers(self.transfers.clone());
-        cx.notify();
-    }
-
-    pub(crate) fn retry_connection_progress(&mut self, cx: &mut Context<Self>) {
-        let Some(progress) = self.connection_progress.clone() else {
-            return;
-        };
-        self.connection_progress = None;
-        let mut retry_tabs = Vec::new();
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            if !tab.connected && tab.session.is_some() && tab.id == progress.tab_id {
-                retry_tabs.push((ix, tab.id.clone(), tab.session.clone().unwrap(), tab.kind));
+    /// Keep queued and running transfers visible even when history reaches its limit.
+    pub(crate) fn save_transfer_records(&mut self, cx: &mut Context<Self>) {
+        let mut finished_records = 0;
+        self.transfers.retain(|transfer| {
+            if transfer.state.is_active() {
+                return true;
             }
-        }
-
-        if retry_tabs.is_empty() {
-            cx.notify();
-            return;
-        }
-
-        for (ix, tab_id, session, tab_kind) in retry_tabs {
-            let backend_events = self.tabs[ix].advance_backend_events();
-            // Invalidate old backend events before requesting shutdown.
-            self.tabs[ix].send_backend(crate::terminal::BackendCommand::Close);
-
-            // Spawn new backend
-            let backend = match tab_kind {
-                crate::terminal::TabKind::Serial => {
-                    let b = crate::backend::serial::spawn_serial_client(
-                        self.runtime.handle(),
-                        tab_id.clone(),
-                        session.clone(),
-                        backend_events.clone(),
-                    );
-                    crate::terminal::BackendTx::Serial(b)
-                }
-                crate::terminal::TabKind::Ssh => crate::backend::ssh::spawn_ssh_terminal(
-                    self.runtime.handle(),
-                    tab_id.clone(),
-                    session.clone(),
-                    self.tabs[ix].cols,
-                    self.tabs[ix].rows,
-                    backend_events.clone(),
-                ),
-                _ => continue,
-            };
-
-            // Replace tab state
-            self.tabs[ix].set_backend(backend);
-            self.tabs[ix].connected = false;
-            self.tabs[ix].status = "connecting".into();
-            self.tabs[ix].disconnected_reason = None;
-            self.tabs[ix].terminal_title_received = false;
-
-            if tab_kind == crate::terminal::TabKind::Ssh
-                && self.active_tab.as_deref() == Some(tab_id.as_str())
-            {
-                self.restart_active_sftp();
-            }
-        }
-
-        self.connection_progress = Some(ConnectionProgress {
-            tab_id: progress.tab_id.clone(),
-            title: t!("connecting").into(),
-            lines: vec![t!("starting_connection").into()],
-            failed: false,
+            finished_records += 1;
+            finished_records <= 100
         });
-        self.status = "ssh tabs retrying".into();
+        self.config.set_transfers(self.transfers.clone());
+        if self.transfer_save_task.is_none() && self.config.read_only_reason().is_none() {
+            self.transfer_save_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let _ = this.update(cx, |this, _| {
+                    this.transfer_save_task = None;
+                    this.save_preferences_background();
+                });
+            }));
+        }
+    }
+
+    /// Resolve controls by transfer UUID, even after the user switches servers.
+    fn transfer_handle(&self, transfer_id: &str) -> Option<&crate::sftp::SftpHandle> {
+        self.sftp_handles
+            .values()
+            .find(|handle| handle.has_transfer(transfer_id))
+    }
+
+    pub(crate) fn pause_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
+        if let Some(handle) = self.transfer_handle(transfer_id) {
+            handle.pause_transfer(transfer_id);
+        } else if let Some(transfer) = self.transfers.iter_mut().find(|t| t.info.id == transfer_id)
+        {
+            transfer.interrupt(t!("transfer_connection_closed").to_string());
+        }
+        self.save_transfer_records(cx);
         cx.notify();
     }
 
-    pub(crate) fn cancel_connection_progress(&mut self, cx: &mut Context<Self>) {
-        if let Some(progress) = &self.connection_progress {
-            let tab_id = progress.tab_id.clone();
+    pub(crate) fn resume_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
+        if let Some(handle) = self.transfer_handle(transfer_id) {
+            handle.resume_transfer(transfer_id);
+        } else if let Some(transfer) = self.transfers.iter_mut().find(|t| t.info.id == transfer_id)
+        {
+            transfer.interrupt(t!("transfer_connection_closed").to_string());
+        }
+        self.save_transfer_records(cx);
+        cx.notify();
+    }
+
+    /// Cancellation must update the record even when its worker is already gone.
+    pub(crate) fn cancel_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
+        if let Some(handle) = self.transfer_handle(transfer_id) {
+            handle.cancel_transfer(transfer_id);
+        }
+        if let Some(transfer) = self.transfers.iter_mut().find(|t| t.info.id == transfer_id) {
+            transfer.interrupt(t!("transfer_cancelled").to_string());
+        }
+        self.save_transfer_records(cx);
+        cx.notify();
+    }
+
+    /// Removing a record cancels its worker without depending on a network reply.
+    pub(crate) fn remove_transfer(&mut self, transfer_id: &str, cx: &mut Context<Self>) {
+        if let Some(handle) = self.transfer_handle(transfer_id) {
+            handle.cancel_transfer(transfer_id);
+        }
+        self.transfers.retain(|t| t.info.id != transfer_id);
+        self.save_transfer_records(cx);
+        cx.notify();
+    }
+
+    /// Only expose connection controls for the tab currently receiving input.
+    pub(crate) fn active_connection_progress(&self) -> Option<&ConnectionProgress> {
+        self.connection_progress
+            .as_ref()
+            .filter(|progress| self.active_tab.as_deref() == Some(progress.tab_id.as_str()))
+    }
+
+    /// Retry the tab captured by the visible progress controls, using the same
+    /// session snapshot and backend replacement path as the reconnect bar.
+    pub(crate) fn retry_connection_progress(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        if !self
+            .active_connection_progress()
+            .is_some_and(|progress| progress.failed && progress.tab_id == tab_id)
+        {
+            return;
+        }
+
+        self.retry_disconnected_tab(tab_id, cx);
+    }
+
+    /// Ignore stale controls after the active tab or progress target changes.
+    pub(crate) fn cancel_connection_progress(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        if self
+            .active_connection_progress()
+            .is_some_and(|progress| progress.tab_id == tab_id)
+        {
             self.connection_progress = None;
-            self.handle_tab_close(tab_id);
+            self.handle_tab_close(tab_id.to_string());
         }
         cx.notify();
     }
@@ -2361,11 +2463,12 @@ impl Ashell {
 
     pub(crate) fn save_layout_state(&mut self, window: &mut gpui::Window, cx: &gpui::App) {
         self.window_bounds_save_task = None;
+        let pending_transfer_save = self.transfer_save_task.take().is_some();
         let should_save_tabs = self.config.remember_tabs();
         if should_save_tabs {
             self.capture_tabs_state();
         }
-        if self.capture_layout_state(window, cx) || should_save_tabs {
+        if self.capture_layout_state(window, cx) || should_save_tabs || pending_transfer_save {
             let current_seq = self
                 .save_latest_seq
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -2441,7 +2544,7 @@ mod tests {
 
     use super::{
         BACKEND_EVENT_TIME_BUDGET, MAX_BACKEND_EVENTS_PER_TICK, MAX_BACKEND_OUTPUT_BYTES_PER_TICK,
-        MAX_COALESCED_OUTPUT_BYTES, PaneLayout, TerminalNotificationOccasion,
+        MAX_COALESCED_OUTPUT_BYTES, PaneLayout, TabGroup, TerminalNotificationOccasion,
         backend_drain_budget_allows_more, merge_adjacent_output, should_show_terminal_notification,
     };
 
@@ -2470,6 +2573,85 @@ mod tests {
         assert_eq!(layout.tab_ids(), vec!["second", "third"]);
         assert_eq!(layout.first_tab_id(), Some("second"));
         assert_eq!(layout.total_panes(), 2);
+    }
+
+    /// Build groups without starting terminal backends for focus regression tests.
+    fn focus_test_group(id: &str, pane_root: PaneLayout) -> TabGroup {
+        TabGroup {
+            id: id.to_string(),
+            title: id.to_string(),
+            pane_root,
+            focused_tab_id: None,
+            sftp: None,
+            sftp_tab_id: None,
+        }
+    }
+
+    #[test]
+    fn tab_groups_keep_independent_focus_when_switching_and_reordering() {
+        let mut groups = vec![
+            focus_test_group(
+                "A",
+                PaneLayout::Horizontal(
+                    vec![
+                        PaneLayout::Single("A-top".into()),
+                        PaneLayout::Single("A-bottom".into()),
+                    ],
+                    0.5,
+                ),
+            ),
+            focus_test_group(
+                "B",
+                PaneLayout::Vertical(
+                    vec![
+                        PaneLayout::Single("B-left".into()),
+                        PaneLayout::Single("B-right".into()),
+                    ],
+                    0.5,
+                ),
+            ),
+        ];
+        groups[0].remember_focus(Some("A-bottom"));
+        groups[1].remember_focus(Some("B-right"));
+        // A focus notification from another group cannot erase the remembered pane.
+        groups[0].remember_focus(Some("B-right"));
+        groups.reverse();
+        for (group_id, expected_pane) in [("A", "A-bottom"), ("B", "B-right"), ("A", "A-bottom")] {
+            let group = groups.iter().find(|group| group.id == group_id).unwrap();
+            assert_eq!(group.focus_target(), Some(expected_pane));
+        }
+    }
+
+    #[test]
+    fn remembered_pane_survives_nested_splits_and_falls_back_after_closing() {
+        let mut group = focus_test_group(
+            "A",
+            PaneLayout::Horizontal(
+                vec![
+                    PaneLayout::Single("top".into()),
+                    PaneLayout::Single("bottom".into()),
+                ],
+                0.5,
+            ),
+        );
+        group.remember_focus(Some("bottom"));
+        group.pane_root.replace_at(
+            &[1],
+            PaneLayout::Vertical(
+                vec![
+                    PaneLayout::Single("bottom".into()),
+                    PaneLayout::Single("right".into()),
+                ],
+                0.5,
+            ),
+        );
+        group.pane_root.remove_tab("top");
+        assert_eq!(group.focus_target(), Some("bottom"));
+        assert_eq!(group.pane_root.focused_tab_id(&[0]), group.focus_target());
+        group.pane_root.remove_tab("bottom");
+        assert_eq!(group.focus_target(), Some("right"));
+        group.pane_root.remove_tab("right");
+        assert_eq!(group.focus_target(), None);
     }
 
     #[test]
@@ -2528,6 +2710,73 @@ mod tests {
             0,
             BACKEND_EVENT_TIME_BUDGET,
         ));
+    }
+
+    #[test]
+    fn pending_lookahead_events_keep_their_generation_until_the_next_drain() {
+        use crate::terminal::GuardedBackendEventSender;
+        use std::sync::mpsc;
+
+        for event in [
+            BackendEvent::Closed {
+                tab_id: "tab".into(),
+                reason: "old connection".into(),
+            },
+            BackendEvent::SftpHome {
+                tab_id: "tab".into(),
+                home: "/old".into(),
+            },
+            BackendEvent::Output {
+                tab_id: "other".into(),
+                bytes: vec![1],
+            },
+            BackendEvent::Output {
+                tab_id: "tab".into(),
+                bytes: vec![1, 2],
+            },
+        ] {
+            let (events, received) = mpsc::channel();
+            let sender = GuardedBackendEventSender::new(events);
+            sender.send(event).unwrap();
+            let mut bytes = vec![0; MAX_COALESCED_OUTPUT_BYTES - 1];
+            let pending = merge_adjacent_output("tab", &mut bytes, received.recv().unwrap())
+                .expect_err("non-mergeable events must remain guarded while pending");
+            sender.invalidate();
+            assert!(pending.into_current().is_none());
+        }
+    }
+
+    #[test]
+    fn output_coalescing_skips_invalidated_events_and_accepts_current_output() {
+        use crate::terminal::GuardedBackendEventSender;
+        use std::sync::mpsc;
+
+        let (events, received) = mpsc::channel();
+        let sender = GuardedBackendEventSender::new(events.clone());
+        sender
+            .send(BackendEvent::Output {
+                tab_id: "tab".into(),
+                bytes: b"stale".to_vec(),
+            })
+            .unwrap();
+        sender.invalidate();
+        let current = GuardedBackendEventSender::new(events);
+        current
+            .send(BackendEvent::Output {
+                tab_id: "tab".into(),
+                bytes: b"current".to_vec(),
+            })
+            .unwrap();
+        let mut bytes = Vec::new();
+        assert_eq!(
+            merge_adjacent_output("tab", &mut bytes, received.recv().unwrap()).unwrap(),
+            0
+        );
+        assert_eq!(
+            merge_adjacent_output("tab", &mut bytes, received.recv().unwrap()).unwrap(),
+            7
+        );
+        assert_eq!(bytes, b"current");
     }
 
     #[test]

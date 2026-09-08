@@ -1,17 +1,22 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use directories::BaseDirs;
 use russh::{
-    ChannelMsg, Disconnect,
+    ChannelMsg,
     client::{self, Handler},
     keys::{PrivateKey, decode_secret_key, load_secret_key},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
+
+use super::connection::{ConnectionControl, ConnectionGuard, SshConnection, connect_with_timeout};
 
 use crate::{
     session::{
@@ -37,29 +42,76 @@ pub fn spawn_ssh_terminal(
     events: GuardedBackendEventSender,
 ) -> BackendTx {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<BackendCommand>();
-    let task_tab = tab_id.clone();
+    let control = ConnectionControl::new();
+    let owner = Arc::new(control.guard());
     runtime.spawn(async move {
-        if let Err(err) = run_ssh(
-            task_tab.clone(),
-            session,
-            cols,
-            rows,
-            cmd_rx,
-            events.clone(),
-        )
-        .await
-        {
-            let _ = events.send(BackendEvent::Closed {
-                tab_id: task_tab,
-                reason: format!("{err:#}"),
-            });
+        let _connection_guard = control.guard();
+        tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                let _ = events.send(BackendEvent::Closed {
+                    tab_id,
+                    reason: "ssh connection closed".to_string(),
+                });
+            }
+            result = run_ssh(tab_id.clone(), session, cols, rows, cmd_rx, events.clone(), control.clone()) => {
+                if let Err(err) = result {
+                    let _ = events.send(BackendEvent::Closed {
+                        tab_id,
+                        reason: format!("{err:#}"),
+                    });
+                }
+            }
         }
     });
-    BackendTx::Ssh(cmd_tx)
+    BackendTx::Ssh(SshHandle {
+        commands: cmd_tx,
+        owner,
+    })
+}
+
+#[derive(Clone)]
+pub struct SshHandle {
+    commands: mpsc::UnboundedSender<BackendCommand>,
+    owner: Arc<ConnectionGuard>,
+}
+
+impl SshHandle {
+    /// Closing bypasses queued terminal commands and pending SSH setup.
+    pub fn send(&self, command: BackendCommand) {
+        if matches!(command, BackendCommand::Close) {
+            self.owner.cancel();
+        } else {
+            let _ = self.commands.send(command);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RemoteRequest {
+    Metrics,
+    Processes,
+    Ports,
+    Terminate(u32),
+}
+
+/// Release request ownership before publishing the result, so a new UI request
+/// cannot be discarded between its predecessor's result and JoinSet cleanup.
+struct RemoteRequestGuard {
+    requests: Arc<Mutex<std::collections::HashSet<RemoteRequest>>>,
+    request: RemoteRequest,
+}
+
+impl Drop for RemoteRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.remove(&self.request);
+        }
+    }
 }
 
 async fn sample_remote_system_with_handle(
-    handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<SshConnection<ClientHandler>>,
 ) -> Result<SystemSnapshot> {
     let unix_result = async {
         let output = execute_remote_command_with_handle(
@@ -91,24 +143,23 @@ async fn sample_remote_system_with_handle(
 }
 
 async fn execute_remote_command_with_handle(
-    handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<SshConnection<ClientHandler>>,
     command: &str,
     operation: &str,
 ) -> Result<String> {
     let mut channel = handle
-        .lock()
-        .await
-        .channel_open_session()
+        .open_session_channel()
         .await
         .with_context(|| format!("open {operation} session"))?;
-    channel
-        .exec(true, command)
-        .await
-        .with_context(|| format!("execute {operation}"))?;
 
     let mut output = Vec::new();
     let mut exit_status = None;
     let wait_result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        channel
+            .exec(true, command)
+            .await
+            .with_context(|| format!("execute {operation}"))?;
+
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, ext: _ } => {
@@ -121,12 +172,11 @@ async fn execute_remote_command_with_handle(
                 _ => {}
             }
         }
+        Ok::<(), anyhow::Error>(())
     })
     .await;
 
-    if wait_result.is_err() {
-        return Err(anyhow!("{operation} timed out after 20 seconds"));
-    }
+    wait_result.with_context(|| format!("{operation} timed out after 20 seconds"))??;
 
     let output = String::from_utf8_lossy(&output).trim().to_string();
     if exit_status.is_none_or(|status| status != 0) {
@@ -144,7 +194,7 @@ async fn execute_remote_command_with_handle(
 }
 
 async fn sample_remote_processes_with_handle(
-    handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<SshConnection<ClientHandler>>,
 ) -> Result<Vec<RemoteProcess>> {
     let unix_result = async {
         let output = execute_remote_command_with_handle(
@@ -191,7 +241,7 @@ fn parse_remote_process_probe(output: &str, operation: &str) -> Result<Vec<Remot
 }
 
 async fn sample_remote_ports_with_handle(
-    handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<SshConnection<ClientHandler>>,
 ) -> Result<Vec<RemotePort>> {
     let unix_result = async {
         let output = execute_remote_command_with_handle(
@@ -238,7 +288,7 @@ fn parse_remote_port_probe(output: &str, operation: &str) -> Result<Vec<RemotePo
 }
 
 async fn terminate_remote_process_with_handle(
-    handle: Arc<tokio::sync::Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<SshConnection<ClientHandler>>,
     pid: u32,
 ) -> Result<()> {
     if pid <= 1 {
@@ -277,6 +327,7 @@ async fn run_ssh(
     rows: u16,
     mut commands: mpsc::UnboundedReceiver<BackendCommand>,
     events: GuardedBackendEventSender,
+    control: ConnectionControl,
 ) -> Result<()> {
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.clone(),
@@ -286,21 +337,20 @@ async fn run_ssh(
         ),
     });
 
-    let handle = Arc::new(tokio::sync::Mutex::new(
-        connect_and_authenticate(&tab_id, &session, &events).await?,
-    ));
-
-    let mut channel = handle
-        .lock()
-        .await
-        .channel_open_session()
-        .await
-        .context("open session")?;
-    channel
-        .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
-        .await
-        .context("request pty")?;
-    channel.request_shell(true).await.context("request shell")?;
+    let (handle, mut channel) = connect_with_timeout(async {
+        let handle = Arc::new(connect_and_authenticate(&tab_id, &session, &events, control).await?);
+        let channel = handle
+            .open_session_channel()
+            .await
+            .context("open session")?;
+        channel
+            .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+            .await
+            .context("request pty")?;
+        channel.request_shell(true).await.context("request shell")?;
+        Ok((handle, channel))
+    })
+    .await?;
 
     let _ = events.send(BackendEvent::Status {
         tab_id: tab_id.clone(),
@@ -312,9 +362,13 @@ async fn run_ssh(
 
     let exit_reason;
     let mut is_graceful_close = false;
+    let requests = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let mut tasks = JoinSet::new();
+    let channel_slots = Arc::new(Semaphore::new(3));
 
     loop {
         tokio::select! {
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
             command = commands.recv() => {
                 match command {
                     Some(BackendCommand::Input(bytes)) => {
@@ -328,11 +382,18 @@ async fn run_ssh(
                         let _ = channel.window_change(cols.into(), rows.into(), 0, 0).await;
                     }
                     Some(BackendCommand::SampleMetrics) => {
+                        let request = RemoteRequest::Metrics;
+                        if !requests.lock().expect("SSH request registry").insert(request) { continue; }
+                        let request_guard = RemoteRequestGuard { requests: requests.clone(), request };
                         let handle_clone = handle.clone();
                         let tab_id_clone = tab_id.clone();
                         let events_clone = events.clone();
-                        tokio::spawn(async move {
-                            match sample_remote_system_with_handle(handle_clone).await {
+                        let slots = channel_slots.clone();
+                        tasks.spawn(async move {
+                            let _permit = slots.acquire_owned().await.expect("open SSH request semaphore");
+                            let result = sample_remote_system_with_handle(handle_clone).await;
+                            drop(request_guard);
+                            match result {
                                 Ok(snapshot) => {
                                     let _ = events_clone.send(BackendEvent::RemoteSystem {
                                         tab_id: tab_id_clone,
@@ -349,11 +410,18 @@ async fn run_ssh(
                         });
                     }
                     Some(BackendCommand::SampleProcesses) => {
+                        let request = RemoteRequest::Processes;
+                        if !requests.lock().expect("SSH request registry").insert(request) { continue; }
+                        let request_guard = RemoteRequestGuard { requests: requests.clone(), request };
                         let handle_clone = handle.clone();
                         let tab_id_clone = tab_id.clone();
                         let events_clone = events.clone();
-                        tokio::spawn(async move {
-                            match sample_remote_processes_with_handle(handle_clone).await {
+                        let slots = channel_slots.clone();
+                        tasks.spawn(async move {
+                            let _permit = slots.acquire_owned().await.expect("open SSH request semaphore");
+                            let result = sample_remote_processes_with_handle(handle_clone).await;
+                            drop(request_guard);
+                            match result {
                                 Ok(processes) => {
                                     let _ = events_clone.send(BackendEvent::RemoteProcesses {
                                         tab_id: tab_id_clone,
@@ -374,11 +442,18 @@ async fn run_ssh(
                         });
                     }
                     Some(BackendCommand::SamplePorts) => {
+                        let request = RemoteRequest::Ports;
+                        if !requests.lock().expect("SSH request registry").insert(request) { continue; }
+                        let request_guard = RemoteRequestGuard { requests: requests.clone(), request };
                         let handle_clone = handle.clone();
                         let tab_id_clone = tab_id.clone();
                         let events_clone = events.clone();
-                        tokio::spawn(async move {
-                            match sample_remote_ports_with_handle(handle_clone).await {
+                        let slots = channel_slots.clone();
+                        tasks.spawn(async move {
+                            let _permit = slots.acquire_owned().await.expect("open SSH request semaphore");
+                            let result = sample_remote_ports_with_handle(handle_clone).await;
+                            drop(request_guard);
+                            match result {
                                 Ok(ports) => {
                                     let _ = events_clone.send(BackendEvent::RemotePorts {
                                         tab_id: tab_id_clone,
@@ -399,11 +474,18 @@ async fn run_ssh(
                         });
                     }
                     Some(BackendCommand::TerminateProcess { pid }) => {
+                        let request = RemoteRequest::Terminate(pid);
+                        if !requests.lock().expect("SSH request registry").insert(request) { continue; }
+                        let request_guard = RemoteRequestGuard { requests: requests.clone(), request };
                         let handle_clone = handle.clone();
                         let tab_id_clone = tab_id.clone();
                         let events_clone = events.clone();
-                        tokio::spawn(async move {
-                            match terminate_remote_process_with_handle(handle_clone, pid).await {
+                        let slots = channel_slots.clone();
+                        tasks.spawn(async move {
+                            let _permit = slots.acquire_owned().await.expect("open SSH request semaphore");
+                            let result = terminate_remote_process_with_handle(handle_clone, pid).await;
+                            drop(request_guard);
+                            match result {
                                 Ok(()) => {
                                     let _ = events_clone.send(
                                         BackendEvent::RemoteProcessTerminated {
@@ -469,11 +551,8 @@ async fn run_ssh(
         }
     }
 
-    let _ = handle
-        .lock()
-        .await
-        .disconnect(Disconnect::ByApplication, "bye", "")
-        .await;
+    tasks.abort_all();
+    handle.close();
     let _ = events.send(BackendEvent::Closed {
         tab_id,
         reason: exit_reason,
@@ -485,7 +564,8 @@ async fn connect_and_authenticate(
     tab_id: &str,
     session: &Session,
     events: &GuardedBackendEventSender,
-) -> Result<russh::client::Handle<ClientHandler>> {
+    control: ConnectionControl,
+) -> Result<SshConnection<ClientHandler>> {
     let config = Arc::new(crate::session::config::ssh_client_config());
     let addr = format!("{}:{}", session.host, session.port);
     tracing::info!(
@@ -510,9 +590,19 @@ async fn connect_and_authenticate(
         text: status_text,
     });
     let stream = crate::session::config::connect_proxy(session).await?;
-    let mut handle = client::connect_stream(config, stream, ClientHandler)
-        .await
-        .with_context(|| format!("connect {addr} failed"))?;
+    let stream = control.attach(stream)?;
+    let mut handle = client::connect_stream(
+        config,
+        stream,
+        ClientHandler {
+            tab_id: tab_id.to_string(),
+            host: session.host.clone(),
+            port: session.port,
+            events: events.clone(),
+        },
+    )
+    .await
+    .with_context(|| format!("connect {addr} failed"))?;
 
     tracing::debug!("[ssh] tcp connected to {}", addr);
 
@@ -691,9 +781,6 @@ async fn connect_and_authenticate(
 
     if !authed {
         tracing::warn!("[ssh] authentication failed for {}@{}", session.user, addr);
-        let _ = handle
-            .disconnect(Disconnect::ByApplication, "auth failed", "")
-            .await;
         return Err(anyhow!(
             "{}",
             match session.auth {
@@ -730,7 +817,7 @@ async fn connect_and_authenticate(
         ),
     });
 
-    Ok(handle)
+    Ok(SshConnection::new(handle, control))
 }
 
 fn load_session_private_key(session: &Session) -> Result<PrivateKey> {
@@ -1146,15 +1233,31 @@ Get-Process | ForEach-Object { $processNames[[int]$_.Id] = $_.ProcessName }
 }"#;
 
 #[derive(Clone)]
-struct ClientHandler;
+struct ClientHandler {
+    tab_id: String,
+    host: String,
+    port: u16,
+    events: GuardedBackendEventSender,
+}
 
 impl Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        crate::session::host_keys::verify(
+            &self.tab_id,
+            &self.host,
+            self.port,
+            server_public_key,
+            |mut event| {
+                if let BackendEvent::HostKeyVerification(request) = &mut event {
+                    request.attempt = Some(self.events.attempt());
+                }
+                let _ = self.events.send(event);
+            },
+        )
     }
 }

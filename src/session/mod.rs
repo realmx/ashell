@@ -1,4 +1,5 @@
 pub mod config;
+pub(crate) mod host_keys;
 pub mod ssh_config;
 pub mod ssh_keys;
 
@@ -288,6 +289,7 @@ impl Ashell {
                     id: group.id.clone(),
                     title: group.title.clone(),
                     pane_root: save_pane_layout(&group.pane_root),
+                    focused_tab_id: group.focus_target().map(str::to_string),
                     tabs,
                 })
             })
@@ -325,6 +327,7 @@ impl Ashell {
                 id: group_id,
                 title,
                 pane_root,
+                focused_tab_id,
                 tabs,
             } = saved_group;
             if group_id.is_empty() || !restored_group_ids.insert(group_id.clone()) {
@@ -445,6 +448,7 @@ impl Ashell {
                 id: group_id.clone(),
                 title,
                 pane_root,
+                focused_tab_id,
                 // Restored SSH sessions remain offline until the user confirms
                 // reconnecting, so their SFTP worker must remain stopped too.
                 sftp: None,
@@ -458,11 +462,16 @@ impl Ashell {
         let Some(active_group) = active_group else {
             return;
         };
-        let Some(active_layout) = self
+        let Some((active_layout, focused_tab_id)) = self
             .tab_groups
             .iter()
             .find(|group| group.id == active_group)
-            .map(|group| group.pane_root.clone())
+            .map(|group| {
+                (
+                    group.pane_root.clone(),
+                    group.focus_target().map(str::to_string),
+                )
+            })
         else {
             return;
         };
@@ -471,7 +480,7 @@ impl Ashell {
         self.pane_root = active_layout;
         let active_tab = requested_active_tab
             .filter(|id| self.pane_root.contains(id))
-            .or_else(|| self.pane_root.first_tab_id().map(str::to_string));
+            .or(focused_tab_id);
         if let Some(active_tab) = active_tab {
             self.focus_pane_with_id(active_tab);
         }
@@ -659,6 +668,7 @@ impl Ashell {
         self.tab_groups.push(TabGroup {
             id: group_id.clone(),
             title,
+            focused_tab_id: Some(id.clone()),
             pane_root: PaneLayout::Single(id),
             sftp: None,
             sftp_tab_id: None,
@@ -1396,6 +1406,7 @@ impl Ashell {
             DEFAULT_ROWS,
             backend_events.clone(),
         );
+        let attempt = backend_events.attempt();
         self.tabs.push(TerminalTab::new_ssh(
             id.clone(),
             &session,
@@ -1416,6 +1427,7 @@ impl Ashell {
             id: group_id.clone(),
             title: session.name.clone(),
             pane_root: PaneLayout::Single(id.clone()),
+            focused_tab_id: Some(id.clone()),
             sftp: Some(connecting_sftp_state()),
             sftp_tab_id: Some(id.clone()),
         });
@@ -1437,6 +1449,7 @@ impl Ashell {
             id.clone(),
             session,
             self.events_tx.clone(),
+            attempt,
         );
         self.sftp_handles.insert(group_id.clone(), sftp_handle);
         self.active_tab = Some(id.clone());
@@ -1484,6 +1497,7 @@ impl Ashell {
             id: group_id.clone(),
             title: session.name.clone(),
             pane_root: PaneLayout::Single(id.clone()),
+            focused_tab_id: Some(id.clone()),
             sftp: None,
             sftp_tab_id: None,
         });
@@ -1712,11 +1726,22 @@ impl Ashell {
             return;
         }
 
+        self.clear_ssh_input_tracking(tab_id);
         let is_ssh = self.tabs[ix].session.is_some();
         let session = self.tabs[ix].session.clone();
         let cols = self.tabs[ix].cols;
         let rows = self.tabs[ix].rows;
         let mut local_shell_fallback = false;
+
+        if let Some(session) = &session {
+            tracing::info!(
+                tab_id,
+                session_id = %session.id,
+                host = %session.host,
+                port = session.port,
+                "[session] retrying disconnected tab with its original connection"
+            );
+        }
 
         let backend_events = self.tabs[ix].advance_backend_events();
         // Advance the event generation before closing the old backend so its
@@ -1801,6 +1826,18 @@ impl Ashell {
             }
         }
 
+        // A reconnect can also come from the pane bar or restored-session
+        // dialog. Keep any progress display for this tab in the same attempt.
+        if let Some(progress) = self
+            .connection_progress
+            .as_mut()
+            .filter(|progress| progress.tab_id == tab_id)
+        {
+            progress.title = t!("connecting").into();
+            progress.lines = vec![t!("starting_connection").into()];
+            progress.failed = false;
+        }
+
         self.status = if is_ssh {
             "ssh tab retrying".to_string()
         } else if local_shell_fallback {
@@ -1819,12 +1856,7 @@ impl Ashell {
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let previous_active_tab = self.active_tab.clone();
         let active_tab_changed = previous_active_tab.as_deref() != Some(id.as_str());
-        // Save current group state
-        if let Some(group_id) = self.active_group.clone() {
-            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
-                group.pane_root = self.pane_root.clone();
-            }
-        }
+        self.sync_pane_root_to_group();
         self.active_tab = Some(id.clone());
         // Find which group this tab belongs to and restore its pane_root
         let tab_group_index = self
@@ -1875,6 +1907,7 @@ impl Ashell {
     }
 
     pub(crate) fn handle_tab_close(&mut self, id: String) {
+        self.clear_ssh_input_tracking(&id);
         let previous_active_tab = self.active_tab.clone();
         if self
             .connection_progress
@@ -1927,15 +1960,9 @@ impl Ashell {
                 let all_groups = &self.tab_groups;
                 if let Some(pos) = all_groups.iter().position(|g| g.id == group.id) {
                     if pos > 0 {
-                        next_active_id = all_groups[pos - 1]
-                            .pane_root
-                            .first_tab_id()
-                            .map(String::from);
+                        next_active_id = all_groups[pos - 1].focus_target().map(String::from);
                     } else if pos + 1 < all_groups.len() {
-                        next_active_id = all_groups[pos + 1]
-                            .pane_root
-                            .first_tab_id()
-                            .map(String::from);
+                        next_active_id = all_groups[pos + 1].focus_target().map(String::from);
                     }
                 }
             }
@@ -2470,16 +2497,7 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         let previous_active_tab = self.active_tab.clone();
-        // Save current group state
-        if let Some(current_group_id) = self.active_group.clone() {
-            if let Some(group) = self
-                .tab_groups
-                .iter_mut()
-                .find(|g| g.id == current_group_id)
-            {
-                group.pane_root = self.pane_root.clone();
-            }
-        }
+        self.sync_pane_root_to_group();
         // Load new group state
         if let Some((index, group)) = self
             .tab_groups
@@ -2490,9 +2508,9 @@ impl Ashell {
             self.tabs_scroll_handle.scroll_to_item(index);
             self.pane_root = group.pane_root.clone();
             self.active_group = Some(group_id);
-            if let Some(first_id) = group.pane_root.first_tab_id() {
-                self.active_tab = Some(first_id.to_string());
-                self.focus_pane_with_id(first_id.to_string());
+            if let Some(tab_id) = group.focus_target().map(str::to_string) {
+                self.active_tab = Some(tab_id.clone());
+                self.focus_pane_with_id(tab_id);
             }
             self.focus_handle.focus(window, cx);
         }
@@ -2544,6 +2562,7 @@ impl Ashell {
         if let Some(group_id) = self.active_group.clone() {
             if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
                 group.pane_root = self.pane_root.clone();
+                group.remember_focus(self.active_tab.as_deref());
             }
         }
     }
@@ -2600,11 +2619,20 @@ impl Ashell {
         }
 
         if let Some((tab_id, session)) = target {
+            let Some(attempt) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.backend_events().attempt())
+            else {
+                return;
+            };
             let handle = crate::sftp::spawn_sftp(
                 self.runtime.handle(),
                 tab_id,
                 session,
                 self.events_tx.clone(),
+                attempt,
             );
             self.sftp_handles.insert(group_id, handle);
             self.pending_sftp_path_sync = Some("/".into());

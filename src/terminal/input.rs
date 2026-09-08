@@ -138,22 +138,14 @@ impl Ashell {
             }
         }
 
-        // If the active tab is disconnected and user presses Enter, reconnect
+        // Enter always reconnects the active pane. A failed connection progress
+        // left by another tab must never redirect terminal input to that tab.
         if event.keystroke.key == "enter"
             && !event.keystroke.modifiers.shift
             && !event.keystroke.modifiers.control
             && !event.keystroke.modifiers.alt
             && !event.keystroke.modifiers.platform
         {
-            if let Some(progress) = &self.connection_progress {
-                if progress.failed {
-                    self.retry_connection_progress(cx);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
-                }
-            }
-
             let active_id = self.active_tab.clone();
             if let Some(active_id) = active_id {
                 let is_disconnected = self
@@ -354,6 +346,12 @@ impl Ashell {
         tab.send_backend(BackendCommand::Input(encoded));
         window.invalidate_character_coordinates();
         cx.notify();
+    }
+
+    pub(crate) fn clear_ssh_input_tracking(&mut self, tab_id: &str) {
+        self.ssh_command_buffers.remove(tab_id);
+        self.ssh_command_starts.remove(tab_id);
+        self.ssh_command_input_uncertain.remove(tab_id);
     }
 
     /// Track the current SSH shell line and persist completed commands.
@@ -1348,25 +1346,30 @@ fn buffer_position_in_viewport(
     (row < snapshot.rows && position.1 < snapshot.cols).then_some((row, position.1))
 }
 
+/// Persist only text confirmed on screen; raw keystrokes may be passwords.
 fn command_history_text(rendered: Option<&str>, buffered: &str, input_uncertain: bool) -> String {
     let rendered = rendered.unwrap_or_default().trim();
     let buffered = buffered.trim();
-    if !input_uncertain && !buffered.is_empty() {
-        return buffered.to_string();
-    }
-    if rendered.is_empty() {
-        return buffered.to_string();
-    }
-    if buffered.is_empty() {
-        return rendered.to_string();
-    }
-    // Completion extends the current token; a new argument after exact raw input is stale content.
-    if rendered
-        .strip_prefix(buffered)
-        .and_then(|suffix| suffix.chars().next())
-        .is_some_and(char::is_whitespace)
+    if rendered.is_empty()
+        || rendered
+            .chars()
+            .all(|character| matches!(character, '*' | '•'))
     {
-        return buffered.to_string();
+        return String::new();
+    }
+    if !input_uncertain && !buffered.is_empty() {
+        return rendered
+            .strip_prefix(buffered)
+            .map(|_| rendered[..buffered.len()].to_string())
+            .unwrap_or_default();
+    }
+    if !buffered.is_empty()
+        && rendered
+            .strip_prefix(buffered)
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(char::is_whitespace)
+    {
+        return rendered[..buffered.len()].to_string();
     }
     rendered.to_string()
 }
@@ -1657,10 +1660,23 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_raw_input_when_uncertain_screen_text_is_unavailable() {
+    fn skips_history_when_server_echo_is_unavailable() {
         let command = "sh /site/jimureport/jimureport-restart.sh";
 
-        assert_eq!(command_history_text(None, command, true), command);
+        assert_eq!(command_history_text(None, command, true), "");
+        assert_eq!(command_history_text(None, "sudo-password", false), "");
+        assert_eq!(
+            command_history_text(Some("sudo-"), "sudo-password", false),
+            ""
+        );
+        assert_eq!(
+            command_history_text(Some("********"), "sudo-password", false),
+            ""
+        );
+        assert_eq!(
+            command_history_text(Some("********"), "sudo-password", true),
+            ""
+        );
     }
 
     #[test]
